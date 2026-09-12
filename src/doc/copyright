@@ -1,0 +1,16 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: miku-voicebank (a joke package)
+
+Files: *
+Copyright: 2026 the miku-voicebank joke
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy of
+ this software and associated documentation files (the "Software"), to deal in
+ the Software without restriction, including without limitation the rights to
+ use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ the Software, and to permit persons to whom the Software is furnished to do so.
+ .
+ The song "初音ミクの消失" (Hatsune Miku no Shoushitsu) is (c) cosMo@暴走P,
+ voice (c) Crypton Future Media, and is NOT covered by this licence.  It ships
+ with this package only because the removal sequence is built around it; keep
+ the package to yourself and buy the album.

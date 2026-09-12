@@ -1,0 +1,36 @@
+name: build-deb
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: self test
+        run: python3 tests/test_show.py
+
+      - name: build the package chain
+        run: |
+          python3 tools/build_deb.py --count 51 \
+            --audio-url "${{ vars.AUDIO_URL || 'https://fms.uiero.com/downloads/mkrm.mp3' }}"
+
+      - name: inspect a package
+        run: |
+          dpkg-deb -I dist/miku-voicebank-pack1_*.deb
+          dpkg-deb -c dist/miku-voicebank-pack1_*.deb | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miku-voicebank-debs
+          path: dist/*.deb
+          retention-days: 30

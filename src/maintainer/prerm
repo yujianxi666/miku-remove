@@ -1,0 +1,27 @@
+#!/bin/sh
+# miku-voicebank-pack* - prerm
+#
+# 卸载时让声库唱完最后一首歌。每个包的 prerm 都会调用一次 miku-show：
+#
+#   第一个 prerm 把演出丢到后台（conductor）开始放歌；
+#   之后每个 prerm 只负责"等到歌曲里属于自己的那一刻"再返回 ——
+#   于是 dpkg 每隔几秒真的删掉一个包，apt 的进度条跟着歌词一点点涨，
+#   而不是卡在 0% 五分钟再直接跳到 100%。
+#
+# __INDEX__ 是本包在链条里的名次（1..__COUNT__），本体包是 0（一直等到唱完）。
+set -e
+
+case "$1" in
+    remove|purge)
+        SHOW=/usr/share/miku-voicebank/bin/miku-show
+        if [ -x "$SHOW" ]; then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 900 "$SHOW" --tick --index __INDEX__ --count __COUNT__ || true
+            else
+                "$SHOW" --tick --index __INDEX__ --count __COUNT__ || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

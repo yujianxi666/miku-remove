@@ -1,0 +1,32 @@
+#!/bin/sh
+# miku-voicebank-pack* - postinst
+#
+# 每装好一块声库数据就报一声。dpkg 按依赖倒序配置：本体（miku-voicebank-pack）
+# 最先被配置，pack1 最后，所以依赖链横幅由 pack1 打印。
+set -e
+
+case "$1" in
+    configure)
+        if [ "__BASE__" = "1" ]; then
+            echo "[VOCALOID] 声库本体 miku-voicebank-pack (4.0) 已注册"
+            # 歌曲如果是从网络获取的，就在后台先抓下来，卸载时不用等网络
+            if [ -x /usr/share/miku-voicebank/bin/miku-show ]; then
+                nohup /usr/share/miku-voicebank/bin/miku-show --fetch-audio --quiet \
+                    >/dev/null 2>&1 &
+            fi
+        elif [ "__INDEX__" = "1" ]; then
+            cat <<'BANNER'
+
+====================================
+Top-level package installed (miku-voicebank-pack1)
+Dependency chain: 1→2→3→…→__COUNT__→miku-voicebank-pack
+Removing miku-voicebank-pack removes the whole voicebank.
+====================================
+BANNER
+        else
+            echo "[VOCALOID] 声库数据 pack__INDEX__ 已注册（__INDEX__/__COUNT__）"
+        fi
+        ;;
+esac
+
+exit 0

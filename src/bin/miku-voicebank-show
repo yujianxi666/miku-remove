@@ -1,0 +1,4 @@
+#!/bin/sh
+# 手动看一遍卸载演出，不用真的把包卸掉。
+# 直接运行即可；参数会原样传给 miku-show（试试 --calibrate 或 --help）。
+exec /usr/share/miku-voicebank/bin/miku-show "$@"

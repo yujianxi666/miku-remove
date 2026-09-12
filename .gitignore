@@ -1,0 +1,23 @@
+# build output
+dist/
+*.deb
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# never commit the song
+*.mp3
+*.flac
+*.wav
+*.m4a
+*.ogg
+
+# editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
