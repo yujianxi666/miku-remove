@@ -176,25 +176,6 @@ make debs
 * **假记忆文件**：真的会装出 `/usr/share/vocaloid/models/memory/*.img`，其中 `user.img` 是 0444，
   所以歌词里那句"删除失败：user.img 权限有误（只读）"名副其实（虽然只是演出）。
 
-## 上传到 GitHub
-
-```sh
-cd github                      # 本目录
-git init -b main
-git add .
-git commit -m "miku-voicebank: sing 初音ミクの消失 when the voicebank is removed"
-git remote add origin git@github.com:<你的用户名>/miku-remove.git
-git push -u origin main
-```
-
-没有配 SSH key 就用 HTTPS：`git remote add origin https://github.com/<你的用户名>/miku-remove.git`
-（会要求输入用户名 + Personal Access Token 作为密码）。
-
-也可以不装 git：在 GitHub 上新建仓库 → "uploading an existing file" → 把本目录里的文件拖进去。
-
-> 行尾已经在 `.gitattributes` 里钉死为 LF：这些 shell 脚本会被 dpkg 在 Linux 上直接执行，
-> 混进一个 CR 就会变成 `bad interpreter: /bin/sh^M`。`tools/build_deb.py` 打包时也会再归一一次。
-
 ## 版权 / 免责
 
 代码 MIT（见 `LICENSE`）。**歌曲和歌词不属于这个玩笑**：
