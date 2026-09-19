@@ -54,8 +54,3 @@ miku-voicebank-show --stop-audio   # 有残留播放进程时把它停掉
 * `apt remove miku-voicebank-packN` 只拆编号包，本体留着（以后单独卸本体还能再唱一遍）；
 * 演出只唱一遍：后台 conductor 用 `/run/miku-voicebank/conductor.lock` 认领，
   先跑完的 tick 会给后面的 tick 留下 `progress`/`done` 标记。
-
----
-
-歌词与歌曲版权属于 cosMo@暴走P / Crypton Future Media。
-这个包只是个玩笑，不要拿去干正经事。
