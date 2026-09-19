@@ -22,6 +22,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import profiles  # noqa: E402
+
 # --- constants of the source video -----------------------------------------
 SONG_START = 30.583      # SRT time where the song starts (deletion begins)
 SONG_END = 279.816       # SRT time where the removal reaches 100% (/ 4:39.816)
@@ -77,6 +80,22 @@ def classify(text):
     return "lyric", text
 
 
+def tokenize(text: str) -> str:
+    """Turn the package-manager flavoured bits into ``<TOKEN>`` placeholders.
+
+    The timeline ships with this project, so it is written the way the source
+    video wrote it (an Arch user's `yay`).  That is the one line that has to read
+    like the machine the package is installed on, so it is left as a token here
+    and expanded by tools/profiles.py at build time: `yay` becomes `apt` on
+    Debian, `dnf` on Fedora, `pacman` on Arch.
+    """
+    if "核心已转储" in text or "core dumped" in text:
+        # `[1]  25891 权限错误 (核心已转储)  yay` -> whichever CLI was running
+        text = profiles.PLACEHOLDER_KERNEL.sub(
+            lambda mm: "%s <PKGMGR>" % mm.group(1), text)
+    return text
+
+
 def build(entries, offset):
     items = []
     for start, end, raw in entries:
@@ -89,6 +108,7 @@ def build(entries, offset):
         if any(d in text for d in OVERLAY_DEBRIS):
             continue
         kind, text = classify(text)
+        text = tokenize(text)
         items.append([max(t, 0.0), end - SONG_START, kind, text])
 
     for start, kind, text in OPENING:

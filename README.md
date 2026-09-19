@@ -111,6 +111,7 @@ miku-voicebank-show --calibrate    # 边听边用 [ ] { } 调歌词偏移，s �
 
 | 键 | 作用 |
 | --- | --- |
+| `PROFILE` | 转写用哪套包管理器的说法：`deb`（默认）/ `rpm` / `pacman` |
 | `AUDIO` | 本地歌曲路径（留空 = 不用本地文件） |
 | `AUDIO_URL` | 歌曲下载地址（留空 = 不下载） |
 | `AUDIO_CACHE` | 下载缓存放哪 |
@@ -118,6 +119,7 @@ miku-voicebank-show --calibrate    # 边听边用 [ ] { } 调歌词偏移，s �
 | `PLAYER` | `auto` 或指定播放器；`auto` 会按格式挑（mp3 不会选 `aplay`） |
 | `AUDIO_START` | 从第几秒开始播（>0 需要能跳播的播放器：mpv/ffplay/vlc） |
 | `AUDIO_OFFSET` | 歌词整体平移秒数 |
+| `AUDIO_TAIL` | 最后一个音符之后再放几秒（默认 1.5，保证尾音不被切掉） |
 | `NO_AUDIO` / `STATUS_STYLE` / `COLOR` / `SPEED` / `FORCE` / `KILL_STRAY` | 静音 / 进度条样式 / 颜色 / 倍速 / 无终端也演满全场 / 演出前清理残留播放进程 |
 | `ORCHESTRATE` / `CONDUCTOR_STALE` | 编排模式开关（0 = 让 apt 卡在 0%）/ conductor 失联判定秒数 |
 
@@ -136,6 +138,15 @@ miku-voicebank-show --calibrate    # 边听边用 [ ] { } 调歌词偏移，s �
 仓库里默认下载的那份音频长 **286.8 秒**：前 25.6 秒是安静的前奏，25.6 秒处一个 +20 dB 的落拍进正歌，
 约 275 秒开始收尾；而删除过程本身是 `279.816 − 30.583 = 249.23` 秒，正好等于 `275 − 25.6`。
 所以默认偏移取 **+25.60 秒**。
+
+时间轴里只有真正和设备有关的那一行留成了占位符（源视频是在 Arch 上录的）：
+
+```
+51.450  lyric  [1]    25891 权限错误 (核心已转储) <PKGMGR>
+```
+
+`tools/profiles.py` 存了三套词表（`deb` = apt/dpkg、`rpm` = dnf/rpm、`pacman` = pacman），
+打包时按 `--profile` 展开写进包里；`miku-show` 的脚本台词（事务、钩子、进度条标签）也走同一套词表。
 
 换别的音频时重新算：
 
@@ -159,9 +170,12 @@ make debs
 │   └── maintainer/{prerm,postinst,postrm}
 ├── tools/
 │   ├── build_deb.py               纯 Python 打包器（ar + tar.gz，不需要 dpkg-deb）
+│   ├── profiles.py                包管理器词表（deb / rpm / pacman）
+│   ├── common.py                  载荷（脚本/时间轴/配置/假记忆文件）
 │   ├── make_timeline.py           从你自己的 SRT 生成时间轴
 │   └── audio_profile.py           电平曲线 / 落拍点 -> 建议偏移
-├── tests/test_show.py             自检（对齐、下载、播放器选择、中断、锁）
+├── tests/test_show.py             自检（对齐、时长、下载、播放器选择、中断、锁）
+├── tests/test_tick.py             自检（编排：本体是否等到整首歌唱完）
 └── .github/workflows/build-deb.yml  CI 里打包并上传 artifacts
 ```
 
@@ -175,6 +189,25 @@ make debs
   "After this operation, 5799 MB ... will be used"）。磁盘紧张就 `--fake-size 0.3`。
 * **假记忆文件**：真的会装出 `/usr/share/vocaloid/models/memory/*.img`，其中 `user.img` 是 0444，
   所以歌词里那句"删除失败：user.img 权限有误（只读）"名副其实（虽然只是演出）。
+
+## 上传到 GitHub
+
+```sh
+cd github                      # 本目录
+git init -b main
+git add .
+git commit -m "miku-voicebank: sing 初音ミクの消失 when the voicebank is removed"
+git remote add origin git@github.com:<你的用户名>/miku-remove.git
+git push -u origin main
+```
+
+没有配 SSH key 就用 HTTPS：`git remote add origin https://github.com/<你的用户名>/miku-remove.git`
+（会要求输入用户名 + Personal Access Token 作为密码）。
+
+也可以不装 git：在 GitHub 上新建仓库 → "uploading an existing file" → 把本目录里的文件拖进去。
+
+> 行尾已经在 `.gitattributes` 里钉死为 LF：这些 shell 脚本会被 dpkg 在 Linux 上直接执行，
+> 混进一个 CR 就会变成 `bad interpreter: /bin/sh^M`。`tools/build_deb.py` 打包时也会再归一一次。
 
 ## 版权 / 免责
 

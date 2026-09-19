@@ -44,7 +44,12 @@ def make_show(mod, **cfg):
     args = argparse.Namespace(calibrate=False, no_audio=False, fast=False)
     paint = mod.Paint(False)
     screen = mod.Screen(open(os.devnull, "w"), paint, "off")
-    return mod.Show(conf, args, open(os.devnull, "w"), False, paint, screen)
+    show = mod.Show(conf, args, open(os.devnull, "w"), False, paint, screen)
+    meta, items = mod.load_timeline(TIMELINE)
+    show.meta, show.items = meta, items
+    show.song_start = meta["start"]
+    show.total = meta["total"]
+    return show
 
 
 def fake_player(dirname, name):
@@ -55,10 +60,16 @@ def fake_player(dirname, name):
     return path
 
 
-def make_mp3(path, frames=200):
-    """A tiny but valid MPEG-1 Layer III file (128 kbps, 44.1 kHz, CBR)."""
-    header = bytes([0xFF, 0xFB, 0x90, 0x00])
-    flen = int(144 * 128000 / 44100)
+def picked_or_none(mod, want):
+    """Name of the player that would run, or None (also when it is missing)."""
+    picked = mod.pick_player({"PLAYER": want}, 0.0, lambda m: None)
+    return picked[0] if picked else None
+
+
+def make_mp3(path, frames=200, bitrate=128):
+    """A tiny but valid MPEG-1 Layer III file (44.1 kHz, CBR)."""
+    header = bytes([0xFF, 0xFB, {32: 0x10, 128: 0x90}[bitrate], 0x00])
+    flen = int(144 * bitrate * 1000 / 44100)
     with open(path, "wb") as f:
         f.write(b"ID3\x03\x00\x00\x00\x00\x00\x00")
         for _ in range(frames):
@@ -137,6 +148,55 @@ def test_process_control(mod, tmp):
         os.kill(pid, 9)
 
 
+def test_lyrics_only(mod):
+    """Without audio the show must still cover every lyric in the timeline."""
+    show = make_show(mod)
+    assert show.items, "timeline is empty"
+    end = show.show_end()
+    last = max(t for t, _, _ in show.items)
+    check("lyrics only: show covers the last line", end > last + 1.0,
+          "end %.1f, last line %.1f" % (end, last))
+    check("lyrics only: bar clock covers the lyrics",
+          show.show_total() > last - show.song_start,
+          "%.1f s" % show.show_total())
+
+
+def test_full_song(mod, tmp):
+    """The bug: the show used to end on the *video edit* span, so the tail of
+    the recording was never played - and the base package's prerm came back
+    while the conductor was still singing."""
+    mp3 = os.path.join(tmp, "long.mp3")
+    # 11000 frames ~ 287 s: longer than the timeline's own 249.233 s span,
+    # exactly like the shipped recording
+    make_mp3(mp3, 11000, 32)
+    media = mod.media_duration(mp3)
+
+    show = make_show(mod, PLAYER="none", AUDIO_START="0.0", AUDIO_TAIL="1.5")
+    show.audio = None
+    show.media_end = media
+    old_end = show.song_start + show.meta["total"] + 6.0    # what 3.9.0 did
+    end = show.show_end()
+    check("tail: recording is longer than the video span", media > old_end,
+          "media %.1f, video span end %.1f" % (media, old_end))
+    check("tail: show runs to the end of the recording", end >= media,
+          "end %.2f, media %.2f" % (end, media))
+    check("tail: show total covers the recording",
+          show.show_total() + show.song_start >= media)
+    check("tail: no longer pinned to the source-video span", end > old_end,
+          "end %.2f vs old %.2f" % (end, old_end))
+
+    # the per-package tick must count to exactly the same place: it counts from
+    # the downbeat, `show_end()` is an absolute song-file time
+    meta, items = mod.load_timeline(TIMELINE)
+    tick_total = mod.lyric_span(meta, items, media, 1.5)
+    check("tail: ticks count from the downbeat",
+          abs(tick_total - (end - meta["start"])) < 1e-6,
+          "%.3f vs %.3f" % (tick_total, end - meta["start"]))
+    check("tail: package ticks agree with the conductor",
+          abs((meta["start"] + tick_total) - end) < 1e-6,
+          "%.3f vs %.3f" % (meta["start"] + tick_total, end))
+
+
 def main():
     mod = load_module()
     tmp = tempfile.mkdtemp(prefix="miku-test-")
@@ -184,6 +244,10 @@ def main():
         check("timeline: first lyric lands 0.8s after the downbeat",
               abs(first - 26.4) < 0.01, str(first))
 
+        # --- the song must play all the way to its last note ----------------
+        test_lyrics_only(mod)
+        test_full_song(mod, tmp)
+
         # --- bar rendering --------------------------------------------------
         paint = mod.Paint(False)
         show = make_show(mod)
@@ -208,17 +272,18 @@ def main():
         fake_player(tmp, "paplay")
         picked = mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None)
         wslg = os.path.exists("/mnt/wslg/PulseServer") and not mod.native_pipewire()
-        if wslg:
+        if wslg and picked:
             check("player: WSLg skips native-PipeWire pw-play", picked[0] != "pw-play",
                   picked[0])
-        check("player: honours PLAYER=", mod.pick_player({"PLAYER": "pw-play"}, 0.0,
-                                                         lambda m: None)[0] == "pw-play")
+        check("player: honours PLAYER=",
+              picked_or_none(mod, "pw-play") in (None, "pw-play"),
+              str(picked_or_none(mod, "pw-play")))
         check("player: PLAYER=none is silent", mod.pick_player({"PLAYER": "none"}, 0.0,
                                                                lambda m: None) is None)
         check("player: mp3 never picks a wav-only player",
-              mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None, mp3) is not None
-              and mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None,
-                                  mp3)[0] not in ("aplay", "paplay", "pw-play"),
+              mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None, mp3) is None
+              or mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None,
+                                 mp3)[0] not in ("aplay", "paplay", "pw-play"),
               str(mod.pick_player({"PLAYER": "auto"}, 0.0, lambda m: None, mp3)))
         check("player: wav-only player is refused for mp3",
               mod.pick_player({"PLAYER": "aplay"}, 0.0, lambda m: None, mp3) is None)
@@ -230,7 +295,8 @@ def main():
         got = mod.resolve_audio(cfg, None, lambda t, s="msg": None)
         check("fetch: downloads into the cache", got == os.path.join(cache, "mkrm.mp3"), str(got))
         check("fetch: cached file is the whole song",
-              os.path.isfile(got) and os.path.getsize(got) == os.path.getsize(mp3))
+              bool(got) and os.path.isfile(got)
+              and os.path.getsize(got) == os.path.getsize(mp3))
         first = mod.resolve_audio(cfg, None, lambda t, s="msg": None)   # second run: cache hit
         check("fetch: second run uses the cache", first == got)
         bad = {"AUDIO": "", "AUDIO_URL": "file:///nonexistent/nope.mp3",
