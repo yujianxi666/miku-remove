@@ -1,0 +1,30 @@
+# 这个仓库的东西全部面向 Linux：Debian 打包脚本、shell maintainer 脚本、
+# Makefile、GitHub Actions。哪怕混进一个 CR，maintainer 脚本就会变成
+# "bad interpreter: /bin/sh^M"，打出来的 .deb 在 dpkg 那里直接失败。
+# 所以：所有文本一律 LF，并且写死在这里，不依赖每个人本地的 core.autocrlf。
+* text=auto eol=lf
+
+# 下面这些是要被 dpkg 直接执行/解析的，单独再钉一遍
+src/bin/*           text eol=lf
+src/maintainer/*    text eol=lf
+src/etc/*           text eol=lf
+src/data/*          text eol=lf
+src/doc/*           text eol=lf
+tools/*             text eol=lf
+tests/*             text eol=lf
+*.py                text eol=lf
+*.sh                text eol=lf
+*.yml               text eol=lf
+*.yaml              text eol=lf
+*.tsv               text eol=lf
+*.conf              text eol=lf
+*.md                text eol=lf
+LICENSE             text eol=lf
+Makefile            text eol=lf
+
+# 音频和构建产物永远不该进仓库（.gitignore 也拦着，这里明说它们是二进制）
+*.mp3  binary
+*.flac binary
+*.wav  binary
+*.ogg  binary
+*.deb  binary

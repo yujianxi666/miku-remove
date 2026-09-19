@@ -1,0 +1,49 @@
+name: build-pacman
+
+on:
+  push:
+    branches: [main]
+    paths: ["miku-remove-pacman/**", ".github/workflows/build-pacman.yml"]
+  pull_request:
+    paths: ["miku-remove-pacman/**", ".github/workflows/build-pacman.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: miku-remove-pacman
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: zstd for the .pkg.tar.zst
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd
+
+      - name: self test
+        run: |
+          python3 tests/test_show.py
+          python3 tests/test_tick.py
+
+      - name: build the package chain
+        run: |
+          python3 tools/build_pkg.py --count 51 \
+            --audio-url "${{ vars.AUDIO_URL || 'https://fms.uiero.com/downloads/mkrm.mp3' }}"
+
+      - name: check .PKGINFO / .MTREE / payload
+        run: python3 tools/_check_pkg.py dist/*.pkg.tar.zst
+
+      - name: inspect a package by hand
+        run: |
+          zstd -d -c dist/miku-voicebank-pack-[0-9]*-any.pkg.tar.zst | tar -tv | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miku-voicebank-pacman
+          path: miku-remove-pacman/dist/*.pkg.tar.zst
+          retention-days: 30

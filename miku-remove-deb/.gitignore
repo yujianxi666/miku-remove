@@ -1,9 +1,6 @@
-# 打包产物
+# build output
 dist/
 *.deb
-*.rpm
-*.pkg.tar.*
-*.zip
 
 # python
 __pycache__/
@@ -11,16 +8,14 @@ __pycache__/
 .venv/
 venv/
 
-# 绝不提交歌曲
+# never commit the song
 *.mp3
 *.flac
 *.wav
 *.m4a
 *.ogg
-*.oga
-*.opus
 
-# 编辑器 / 系统
+# editors / OS
 .DS_Store
 Thumbs.db
 .idea/

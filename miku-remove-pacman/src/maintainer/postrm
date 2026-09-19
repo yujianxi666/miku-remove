@@ -1,0 +1,10 @@
+#!/bin/sh
+# miku-voicebank-pack* - postrm
+#
+# 这里故意什么都不清理。
+#
+# 演出的"只唱一次"时间戳留在 /run/miku-voicebank/show.lock：卸载事务里每个包的
+# prerm 都会尝试触发一次，时间戳保证只有第一个真正开唱。哪个 postrm 要是把它删了，
+# 排在后面的包就会再唱一遍（4 分 09 秒 x 51）。
+# /run 是 tmpfs，重启后自然消失；时间戳本身也会在一分钟后过期。
+exit 0

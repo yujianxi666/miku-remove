@@ -1,0 +1,49 @@
+name: build-rpm
+
+on:
+  push:
+    branches: [main]
+    paths: ["miku-remove-rpm/**", ".github/workflows/build-rpm.yml"]
+  pull_request:
+    paths: ["miku-remove-rpm/**", ".github/workflows/build-rpm.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: miku-remove-rpm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: self test
+        run: |
+          python3 tests/test_show.py
+          python3 tests/test_tick.py
+
+      - name: build the package chain
+        run: |
+          python3 tools/build_rpm.py --count 51 \
+            --audio-url "${{ vars.AUDIO_URL || 'https://fms.uiero.com/downloads/mkrm.mp3' }}"
+
+      - name: check the generated rpm structure
+        run: python3 tools/_check_rpm.py dist/*.rpm
+
+      - name: inspect a package with rpm itself
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq rpm
+          rpm -qpi dist/miku-voicebank-pack-*.noarch.rpm
+          rpm -qpl dist/miku-voicebank-pack-*.noarch.rpm | head -20
+          rpm -qp --scripts dist/miku-voicebank-pack-*.noarch.rpm | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miku-voicebank-rpms
+          path: miku-remove-rpm/dist/*.rpm
+          retention-days: 30

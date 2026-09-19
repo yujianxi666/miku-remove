@@ -1,0 +1,1838 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""miku-show - the VOCALOID voicebank removal ritual.
+
+Runs from the prerm of every ``miku-voicebank-pack*`` package: it plays
+初音ミクの消失 (Hatsune Miku no Shoushitsu) while printing the removal
+transcript the voicebank leaves behind - which is, after all, what that song is
+about: a voicebank that knows it is being deleted, and goes on singing anyway.
+
+    miku-show                 # the full show (what `apt remove` triggers)
+    miku-show --check         # report player / audio / timeline, change nothing
+    miku-show --calibrate     # play the song and nudge AUDIO_OFFSET live
+    miku-show --no-audio      # lyrics only  (same as MIKU_NO_AUDIO=1)
+    miku-show --speed 40      # fast-forward, for testing
+
+Stdlib only, because this has to survive inside dpkg.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+
+VERSION = "3.9.1"
+PACKAGE = "miku-voicebank"
+
+# How long the show runs past the last note.  The removal transcript needs a
+# moment to finish printing after the music stops, and the player must never be
+# cut off while the recording still has something to say.
+TAIL = 1.5
+TAIL_NO_AUDIO = 6.0
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SHARE = os.path.dirname(HERE)
+
+DEFAULT_CONF = "/etc/%s/show.conf" % PACKAGE
+USER_CONF = os.path.join(os.path.expanduser("~"), ".config", PACKAGE, "show.conf")
+TIMELINE_CANDIDATES = [
+    os.path.join(SHARE, "timeline.tsv"),
+    os.path.join(SHARE, "data", "timeline.tsv"),          # in-tree, for development
+    "/usr/share/%s/timeline.tsv" % PACKAGE,
+]
+AUDIO_DIRS = [
+    os.path.join(SHARE, "audio"),
+    os.path.join(SHARE, "..", "assets"),                  # in-tree, for development
+    "/usr/share/%s/audio" % PACKAGE,
+]
+AUDIO_EXT = (".flac", ".wav", ".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac")
+
+# where a downloaded song is cached (first writable one wins)
+CACHE_DIRS = [
+    "/var/cache/miku-voicebank",
+    os.path.join(os.path.expanduser("~"), ".cache", "miku-voicebank"),
+    "/tmp/miku-voicebank-cache",
+]
+
+#: the package manager whose vocabulary the transcript uses unless PROFILE says
+#: otherwise.  Each build of the packages stamps its own (see tools/profiles.py).
+DEFAULT_PROFILE_NAME = "pacman"
+
+DEFAULTS = {
+    "PROFILE": DEFAULT_PROFILE_NAME,   # which package manager's words to use
+    "AUDIO": "",                 # local song file; empty = look in AUDIO_DIRS
+    "AUDIO_URL": "",             # ...or fetch it from here (mp3/ogg/flac/...)
+    "AUDIO_CACHE": "",           # where the download is kept (default: CACHE_DIRS)
+    "AUDIO_FETCH_TIMEOUT": "30",
+    "AUDIO_FETCH_RETRIES": "2",
+    "PLAYER": "auto",            # auto | mpv | ffplay | cvlc | mpg123 | mplayer | pw-play | paplay | play | aplay | none
+    "AUDIO_START": "0",          # where in the file the show begins (seconds)
+    "AUDIO_OFFSET": "0",         # runtime nudge for every lyric line (seconds)
+    "AUDIO_TAIL": "1.5",         # keep playing this long after the last note
+    "NO_AUDIO": "0",
+    "AUDIO_VOLUME": "",          # 0-100, used by players that take a volume flag
+    "STATUS_STYLE": "inline",    # inline | scroll | off
+    "COLOR": "1",
+    "SPEED": "1.0",              # 1 = real time (testing only)
+    "FORCE": "0",                # 1 = run the full show even without a terminal
+    "PACK_COUNT": "51",
+    "TOTAL_SIZE": "5.4 GiB",
+    "QUIET": "0",
+    "KILL_STRAY": "1",           # stop leftover players before starting a new one
+    "ORCHESTRATE": "1",          # spread the removal over the song (see --tick)
+    "CONDUCTOR_STALE": "20",     # give up on a silent conductor after N seconds
+}
+
+# --------------------------------------------------------------------------
+# terminal toolkit
+# --------------------------------------------------------------------------
+
+RESET = "\033[0m"
+
+
+class Paint:
+    """256-colour styles; everything degrades to plain text when off."""
+
+    def __init__(self, enabled: bool):
+        self.on = enabled
+
+    def _c(self, code: str) -> str:
+        return "\033[%sm" % code if self.on else ""
+
+    def _w(self, code: str, s: str) -> str:
+        return ("\033[%sm" % code + s + RESET) if self.on else s
+
+    def tag(self, s):      # the [VOCALOID] marker / drum machine
+        return self._w("38;5;44", s)
+
+    def msg(self, s):      # VOCALOID chatter
+        return self._w("38;5;51", s)
+
+    def lyric(self, s):    # the song
+        return self._w("38;5;231", s)
+
+    def voice(self, s):    # miku talking to the master
+        return self._w("38;5;222", s)
+
+    def sys(self, s):      # deleted files, kill(1), kernel spam
+        return self._w("38;5;203", s)
+
+    def note(self, s):     # section banners
+        return self._w("38;5;170", s)
+
+    def dim(self, s):
+        return self._w("38;5;244", s)
+
+    def bar(self, s):
+        return self._w("38;5;48", s)
+
+
+def dwidth(s: str) -> int:
+    """Display width, so the progress bar does not jitter on CJK text."""
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def clip(s: str, cols: int) -> str:
+    if cols <= 0:
+        return s
+    out, w = [], 0
+    for ch in s:
+        cw = dwidth(ch)
+        if w + cw > cols:
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+class Screen:
+    """Scrolling lines with one live status line kept at the bottom.
+
+    If the terminal goes away (window closed, pipe reader gone) every write
+    fails with EIO/EPIPE; that must never take the removal down with it, so the
+    stream is simply marked broken and the show ends early.
+    """
+
+    def __init__(self, stream, paint: Paint, style: str = "inline"):
+        self.f = stream
+        self.p = paint
+        self.style = style
+        self.broken = False
+        self._status = ""
+        self._drawn = False
+
+    def cols(self) -> int:
+        try:
+            return shutil.get_terminal_size((100, 30)).columns
+        except Exception:
+            return 100
+
+    def _write(self, s: str) -> None:
+        if self.broken:
+            return
+        try:
+            self.f.write(s)
+            self.f.flush()
+        except (OSError, ValueError):
+            self.broken = True
+
+    def line(self, s: str = "") -> None:
+        self._erase()
+        self._write(s + "\n")
+        self._draw()
+
+    def status(self, s: str) -> None:
+        if s == self._status:
+            # scroll mode prints one line per change, so an unchanged status
+            # must not spit out another one
+            if self.style == "scroll" or self._drawn:
+                return
+        self._status = s
+        if self.style == "scroll":
+            self._erase()
+            self._write(s + "\n")
+        elif self.style != "off":
+            self._draw()
+
+    def _erase(self) -> None:
+        if self._drawn:
+            self._write("\r\033[K")
+            self._drawn = False
+
+    def _draw(self) -> None:
+        if not self._status or self.style != "inline" or self.broken:
+            return
+        self._write("\r\033[K" + clip(self._status, self.cols() - 1))
+        self._drawn = True
+
+    def close(self) -> None:
+        self._erase()
+        self._write("\n")
+
+
+def open_output(to_stdout: bool = False):
+    """Return (stream, is_tty).
+
+    Normally the terminal we inherit from apt is already the right place.  If a
+    maintainer script ever runs with its stdout swallowed by a pipe, fall back
+    to /dev/tty so the removal can still be watched.
+    """
+    if to_stdout or sys.stdout.isatty() or os.environ.get("MIKU_STDOUT"):
+        return sys.stdout, sys.stdout.isatty()
+    if os.environ.get("DPKG_MAINTSCRIPT_PACKAGE") or os.environ.get("MIKU_TTY"):
+        try:
+            return open("/dev/tty", "w", buffering=1, encoding="utf-8",
+                        errors="replace"), True
+        except OSError:
+            pass
+    return sys.stdout, False
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def read_conf(path: str) -> dict:
+    out = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip().upper()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def load_config(explicit):
+    cfg = dict(DEFAULTS)
+    used = None
+    for p in [explicit, os.environ.get("MIKU_CONF"), USER_CONF, DEFAULT_CONF]:
+        if p and os.path.isfile(p):
+            cfg.update(read_conf(p))
+            used = p
+            break
+    for k in DEFAULTS:
+        env = os.environ.get("MIKU_" + k)
+        if env is not None:
+            cfg[k] = env
+    return cfg, used
+
+
+def truthy(v) -> bool:
+    return str(v).strip().lower() in ("1", "yes", "true", "on")
+
+
+def as_float(v, default=0.0) -> float:
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def flac_duration(path: str):
+    """Song length straight out of STREAMINFO - no decoder needed."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(42)
+        if head[:4] != b"fLaC":
+            return None
+        body = head[8:42]
+        bits = int.from_bytes(body[10:18], "big")
+        rate = (bits >> 44) & 0xFFFFF
+        total = bits & 0xFFFFFFFFF
+        return total / rate if rate else None
+    except OSError:
+        return None
+
+
+MP3_BITRATES = (None, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, None)
+MP3_RATES = (44100, 48000, 32000, None)
+
+
+def mp3_duration(path: str):
+    """Walk MPEG-1 Layer III frames - an mp3 has no header to read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            pos = 0
+            if head[:3] == b"ID3":
+                pos = 10 + (((head[6] & 0x7F) << 21) | ((head[7] & 0x7F) << 14) |
+                            ((head[8] & 0x7F) << 7) | (head[9] & 0x7F))
+            f.seek(pos)
+            data = f.read()
+    except OSError:
+        return None
+    total = 0.0
+    i, n = 0, len(data)
+    while i + 4 <= n:
+        if data[i] != 0xFF or (data[i + 1] & 0xE0) != 0xE0:
+            i += 1
+            continue
+        h = data[i:i + 4]
+        ver, layer = (h[1] >> 3) & 3, (h[1] >> 1) & 3
+        bri, sri, pad = (h[2] >> 4) & 0xF, (h[2] >> 2) & 3, (h[2] >> 1) & 1
+        if ver != 3 or layer != 1 or bri in (0, 15) or sri == 3:
+            i += 1
+            continue
+        flen = int(144 * MP3_BITRATES[bri] * 1000 / MP3_RATES[sri]) + pad
+        if flen <= 4:
+            i += 1
+            continue
+        total += 1152 / MP3_RATES[sri]
+        i += flen
+    return total or None
+
+
+def media_duration(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".flac":
+        dur = flac_duration(path)
+        if dur:
+            return dur
+    if ext in (".mp3", ".mp2", ".mpa"):
+        dur = mp3_duration(path)
+        if dur:
+            return dur
+    try:
+        import wave
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# fetching the song (so the repo never has to ship it)
+# --------------------------------------------------------------------------
+
+def ensure_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def cache_dir(cfg=None):
+    explicit = (cfg or {}).get("AUDIO_CACHE") or ""
+    for d in ([explicit] if explicit else []) + CACHE_DIRS:
+        if ensure_dir(d):
+            return d
+    return None
+
+
+def url_basename(url: str) -> str:
+    name = os.path.basename(url.split("?")[0].split("#")[0]) or "song.mp3"
+    return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]", "_", name)
+
+
+def download_audio(url: str, dest: str, log, progress=None,
+                   timeout: float = 30.0, retries: int = 2) -> bool:
+    """Download `url` to `dest` atomically.  Returns True on success."""
+    import urllib.request
+    tmp = dest + ".part"
+    for attempt in range(1, int(retries) + 2):
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "miku-voicebank/%s" % VERSION})
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+            if os.path.getsize(tmp) < 1024:
+                raise IOError("下载内容过短")
+            os.replace(tmp, dest)
+            return True
+        except Exception as exc:
+            log("第 %d 次获取失败：%s" % (attempt, exc), "sys")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            if attempt > retries:
+                return False
+            time.sleep(1.5)
+    return False
+
+
+def resolve_audio(cfg, explicit, log, progress=None, allow_download=True):
+    """Find the song: explicit path > configured path > shipped file > cache > URL.
+
+    `log(text, style)` is called for anything worth printing.
+    """
+    for p in [explicit, cfg.get("AUDIO")]:
+        if p and os.path.isfile(p):
+            return p
+    for d in AUDIO_DIRS:
+        if os.path.isdir(d):
+            for name in sorted(os.listdir(d)):
+                if name.lower().endswith(AUDIO_EXT):
+                    return os.path.join(d, name)
+
+    url = (cfg.get("AUDIO_URL") or "").strip()
+    if not url:
+        return None
+    cdir = cache_dir(cfg)
+    if not cdir:
+        log("没有可写的缓存目录，无法下载歌曲", "sys")
+        return None
+    dest = os.path.join(cdir, url_basename(url))
+    if os.path.isfile(dest) and os.path.getsize(dest) > 1024:
+        return dest
+    if not allow_download:
+        return None
+    log("正在从网络获取声库波形：%s" % url, "msg")
+    ok = download_audio(url, dest, log, progress,
+                        as_float(cfg.get("AUDIO_FETCH_TIMEOUT"), 30.0),
+                        as_float(cfg.get("AUDIO_FETCH_RETRIES"), 2))
+    if ok:
+        log("声库波形已就绪：%s（%.1f MiB）" % (dest, os.path.getsize(dest) / 1048576.0), "msg")
+        return dest
+    log("获取失败，本次只输出歌词（也可以手动把音频放进 %s）" % cdir, "sys")
+    return None
+
+
+def find_audio(cfg, explicit):
+    """Backwards-compatible name used by --check: never downloads."""
+    return resolve_audio(cfg, explicit, lambda text, style="msg": None,
+                         allow_download=False)
+
+
+# --------------------------------------------------------------------------
+# audio playback
+# --------------------------------------------------------------------------
+#   name, binary, argv builder(audio, start, volume), supports seeking, formats
+EVERYTHING = AUDIO_EXT
+PLAYERS = [
+    ("mpv", "mpv",
+     lambda a, t, v: ["mpv", "--no-video", "--really-quiet", "--no-terminal"]
+     + (["--start=%.3f" % t] if t else []) + (["--volume=%s" % v] if v else []) + [a],
+     True, EVERYTHING),
+    ("ffplay", "ffplay",
+     lambda a, t, v: ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+     + (["-ss", "%.3f" % t] if t else []) + (["-volume", str(v)] if v else []) + [a],
+     True, EVERYTHING),
+    ("cvlc", "cvlc",
+     lambda a, t, v: ["cvlc", "--intf", "dummy", "--play-and-exit", "--no-video"]
+     + (["--start-time=%.3f" % t] if t else []) + [a],
+     True, EVERYTHING),
+    ("mplayer", "mplayer",
+     lambda a, t, v: ["mplayer", "-really-quiet", "-nolirc"]
+     + (["-ss", "%.3f" % t] if t else []) + [a],
+     True, EVERYTHING),
+    ("mpg123", "mpg123",
+     lambda a, t, v: ["mpg123", "-q"] + (["-k", str(int(t * 38.28))] if t else []) + [a],
+     True, (".mp3", ".mp2", ".mpa")),
+    ("play", "play",
+     lambda a, t, v: ["play", "-q", a] + (["trim", "%.3f" % t] if t else []),
+     False, (".mp3", ".flac", ".ogg", ".wav")),
+    ("pw-play", "pw-play", lambda a, t, v: ["pw-play", a], False,
+     (".wav", ".flac", ".ogg", ".opus")),
+    ("paplay", "paplay", lambda a, t, v: ["paplay", a], False,
+     (".wav", ".flac", ".ogg")),
+    ("aplay", "aplay", lambda a, t, v: ["aplay", "-q", a], False, (".wav",)),
+]
+
+
+def wslg_env() -> dict:
+    """WSLg exposes a PulseAudio socket; players have to be told about it."""
+    env = dict(os.environ)
+    if not env.get("PULSE_SERVER") and os.path.exists("/mnt/wslg/PulseServer"):
+        env["PULSE_SERVER"] = "unix:/mnt/wslg/PulseServer"
+        env.setdefault("PULSE_RUNTIME_PATH", "/mnt/wslg/runtime-dir")
+    return env
+
+
+def native_pipewire() -> bool:
+    """Is there a real PipeWire daemon of our own (as opposed to WSLg's pulse)?"""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.exists(os.path.join(runtime, "pipewire-0"))
+
+
+def pick_player(cfg, start: float, log, audio_path=None):
+    """Pick a player that can actually decode `audio_path` (aplay cannot do mp3)."""
+    want = (cfg.get("PLAYER") or "auto").strip().lower()
+    if want in ("none", "off", "0", "no"):
+        return None
+    ext = os.path.splitext(audio_path)[1].lower() if audio_path else None
+    order = list(PLAYERS)
+    if os.path.exists("/mnt/wslg/PulseServer") and not native_pipewire():
+        # WSLg only offers a PulseAudio socket; pw-play talks the native
+        # PipeWire protocol and would sit there in silence.
+        order.sort(key=lambda p: p[0] == "pw-play")
+    found = [(n, b, f, s) for (n, b, f, s, fmts) in order
+             if want in ("auto", n) and shutil.which(b)
+             and (ext is None or ext in fmts)]
+    if not found:
+        if ext:
+            log("没有能播放 %s 的播放器（mpv / ffplay / vlc / mpg123 都可以）" % ext)
+            log("装上任意一个就能听到声音：sudo apt install mpv")
+        else:
+            log("没有找到可用的音频播放器")
+        return None
+    if start > 0:
+        for p in found:
+            if p[3]:
+                return p
+    return found[0]
+
+
+def _arm_pdeathsig(expected_ppid: int):
+    """Child-side setup: die with the parent (Linux PR_SET_PDEATHSIG).
+
+    Runs after fork(), before exec().  Without this, a player that outlives the
+    show keeps singing to a terminal that no longer exists.
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+        if os.getppid() != expected_ppid:      # parent died in the meantime
+            os._exit(0)
+    except Exception:
+        pass
+
+
+class Audio:
+    def __init__(self, path: str, cfg: dict, log):
+        self.path = path
+        self.cfg = cfg
+        self.log = log
+        self.proc = None
+        self.name = None
+        self.actual_start = 0.0      # where playback really began
+
+    def start(self, start: float) -> None:
+        picked = pick_player(self.cfg, start, self.log, self.path)
+        if not picked:
+            return
+        name, _binary, build, seek = picked
+        if start > 0 and not seek:
+            self.log("%s 不能从中间起播，改从头播放整首" % name)
+            start = 0.0
+        self.actual_start = start
+        argv = build(self.path, start, self.cfg.get("AUDIO_VOLUME") or "")
+        # Deliberately *not* start_new_session: the player has to stay in our
+        # process group, so Ctrl+C and the window closing reach it as well.
+        hook = None
+        if os.name == "posix":
+            import functools
+            hook = functools.partial(_arm_pdeathsig, os.getpid())
+        try:
+            self.proc = subprocess.Popen(
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, env=wslg_env(), preexec_fn=hook)
+            self.name = name
+        except OSError as exc:
+            self.log("启动 %s 失败：%s" % (name, exc))
+            self.proc = None
+            self.actual_start = 0.0
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self, grace: float = 1.5) -> None:
+        """Ask the player to quit (SIGTERM), then insist (SIGKILL)."""
+        if not self.alive():
+            return
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=grace)
+        except Exception:
+            self.kill()
+
+    def kill(self) -> None:
+        if not self.alive():
+            return
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
+def stray_players(audio_path=None):
+    """PIDs of player processes still chewing on our song, found via /proc."""
+    keys = ["miku-voicebank/audio"]
+    if audio_path:
+        keys.append(os.path.realpath(audio_path))
+        keys.append(os.path.basename(audio_path))
+    me = os.getpid()
+    found = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found                      # no procfs (not Linux): nothing to do
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                cmd = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if not cmd or "miku-show" in cmd:      # never kill the show itself
+            continue
+        if any(k and k in cmd for k in keys):
+            found.append(pid)
+    return found
+
+
+def stop_stray_players(audio_path, log, quiet=False):
+    pids = stray_players(audio_path)
+    if not pids:
+        return []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.8)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if not quiet:
+        log("已经停掉还在播放的旧进程：%s" % " ".join(str(p) for p in pids))
+    return pids
+
+
+def stop_signals():
+    """The signals that should end the show on this platform."""
+    names = ("SIGINT", "SIGTERM", "SIGHUP")
+    return tuple(getattr(signal, n) for n in names if hasattr(signal, n))
+
+
+# --------------------------------------------------------------------------
+# timeline
+# --------------------------------------------------------------------------
+
+def find_timeline(explicit):
+    for p in [explicit] + TIMELINE_CANDIDATES:
+        if p and os.path.isfile(p):
+            return p
+    return None
+
+
+# --------------------------------------------------------------------------
+# the package-manager vocabulary
+# --------------------------------------------------------------------------
+#
+# miku-show ships together with tools/profiles.py (the builders copy it next to
+# this script), so that is the single source of truth.  The fallback below only
+# exists so a lone `miku-show` still runs; keep it in sync if a token is added.
+
+FALLBACK_VOCAB = {
+    "deb": {
+        "name": "deb", "family": "Debian / Ubuntu", "PKGMGR": "apt",
+        "PKGEXT": ".deb", "DBDIR": "/var/lib/dpkg",
+        "REMOVECMD": "sudo apt remove miku-voicebank-pack",
+        "VERIFY": "dpkg: 正在校验文件校验和...",
+        "STAGE": "正在删除 miku",
+        "CHECK": "正在检查是否有文件需要被一同移除...",
+        "MEMFILES": "将额外执行：删除 dpkg 所管理的记忆文件（--purge）",
+        "CONFIRM": "确认执行这些操作？[Y/n] y",
+        "TRANSACTION2": "正在执行事务...",
+        "HOOK": "正在运行 dpkg 钩子 vocaloid_remove...",
+        "DBUPDATE": "-> 正在更新 dpkg 状态数据库...",
+        "COMPLETE": ":: 卸载操作完成！",
+        "MEMDEL": "记忆文件（--purge）已删除：{size}",
+        "IMGPERM": "权限有误（只读）",
+    },
+    "rpm": {
+        "name": "rpm", "family": "Fedora / RHEL", "PKGMGR": "dnf",
+        "PKGEXT": ".rpm", "DBDIR": "/var/lib/rpm",
+        "REMOVECMD": "sudo dnf remove miku-voicebank-pack",
+        "VERIFY": "rpm: 正在校验软件包摘要...",
+        "STAGE": "正在删除 miku",
+        "CHECK": "正在检查软件包依赖关系...",
+        "MEMFILES": "将额外执行：删除 rpm 所管理的记忆文件（--nosave）",
+        "CONFIRM": "确认执行这些操作？[Y/n] y",
+        "TRANSACTION2": "正在执行事务...",
+        "HOOK": "正在运行 rpm 钩子 vocaloid_remove...",
+        "DBUPDATE": "-> 正在更新 rpmdb 数据库...",
+        "COMPLETE": ":: 事务完成！",
+        "MEMDEL": "记忆文件（--nosave）已删除：{size}",
+        "IMGPERM": "权限有误（只读）",
+    },
+    "pacman": {
+        "name": "pacman", "family": "Arch / Manjaro", "PKGMGR": "pacman",
+        "PKGEXT": ".pkg.tar.zst", "DBDIR": "/var/lib/pacman",
+        "REMOVECMD": "sudo pacman -R miku-voicebank-pack",
+        "VERIFY": "pacman: 正在校验 .MTREE...",
+        "STAGE": "正在删除 miku",
+        "CHECK": "正在检查软件包依赖关系...",
+        "MEMFILES": "将额外执行：删除 pacman 所管理的记忆文件（--nosave）",
+        "CONFIRM": "确认执行这些操作？[Y/n] y",
+        "TRANSACTION2": "正在执行事务...",
+        "HOOK": "正在运行 pacman 钩子 vocaloid_remove...",
+        "DBUPDATE": "-> 正在更新 pacman 本地数据库...",
+        "COMPLETE": ":: 卸载操作完成！",
+        "MEMDEL": "记忆文件（--nosave）已删除：{size}",
+        "IMGPERM": "权限有误（只读）",
+    },
+}
+
+
+def load_profiles():
+    """Return the real profiles.py if it is installed near this script.
+
+    In the source tree that is ``tools/profiles.py``; in an installed package the
+    builders copy it next to the script (``/usr/share/miku-voicebank/bin/``).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "profiles.py"),                    # next to the script
+        os.path.join(here, "..", "profiles.py"),
+        os.path.join(here, "..", "..", "tools", "profiles.py"),   # source tree
+        os.path.join(here, "..", "..", "..", "tools", "profiles.py"),
+    ]
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "miku_profiles", os.path.abspath(candidate))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if getattr(mod, "PROFILES", None):
+                return mod
+        except Exception:
+            continue
+    return None
+
+
+_PROFILES_MOD = load_profiles()
+VOCAB_TOKENS = tuple(sorted(FALLBACK_VOCAB["deb"]))
+_TOKEN_RE = re.compile(r"<(PKGTOOL|PKGMGR|PKGEXT|PKGEXTS|REMOVECMD|DBDIR|DBDIR2|"
+                       r"DBTYPE|LOCKFILE|LOCKOWNER|VERIFY|STATUSLINE|PURGELINE|"
+                       r"STAGE|TRANSACTION|CACHE|CHECK|MEMFILES|CONFIRM|"
+                       r"TRANSACTION2|INTEGRITY|COMPLETE|HOOK|DBUPDATE|MEMDEL|"
+                       r"IMGERR|IMGWARN|IMGPERM|NOFILE|UNPACK|VERIFY2)>")
+
+
+def get_profile(name=None):
+    """Vocabulary dict for a profile name; unknown names get the deb one."""
+    key = str(name or DEFAULT_PROFILE_NAME).strip().lower()
+    if _PROFILES_MOD is not None:
+        return _PROFILES_MOD.get(key)
+    return FALLBACK_VOCAB.get(key, FALLBACK_VOCAB[DEFAULT_PROFILE_NAME])
+
+
+def default_profile():
+    """The profile this package was built for (PROFILE= in show.conf)."""
+    return DEFAULT_PROFILE_NAME
+
+
+def vocab(text: str, profile) -> str:
+    """Expand `<TOKEN>` in a scripted line with the profile's words."""
+    if "<" not in text:
+        return text
+    return _TOKEN_RE.sub(
+        lambda m: str(profile[m.group(1)]) if profile.get(m.group(1)) is not None
+        else m.group(0), text)
+
+
+def show_end_time(meta, items, media=None, tail: float = TAIL) -> float:
+    """When the show is over, in song-file seconds (absolute, like the timeline).
+
+    The lyric timeline only covers the part of the song the source video used:
+    its ``# total`` is the length of that *edit*, not of the recording, and the
+    shipped mp3 is a good ten seconds longer.  Ending the show there cut the last
+    chord off - and, worse, it let the base package's prerm return while the
+    conductor was still singing, so apt handed the terminal back mid-song and
+    closing it killed the player.  So the clock runs to the end of the recording
+    whenever there is one.
+    """
+    last = max((item[0] for item in items), default=0.0)
+    lyric_end = max(meta.get("start", 0.0) + meta.get("total", 0.0), last + 2.0)
+    if media:
+        return max(lyric_end, media) + tail
+    return lyric_end + TAIL_NO_AUDIO
+
+
+def lyric_span(meta, items, media=None, tail: float = TAIL) -> float:
+    """How many seconds the removal lasts, i.e. what the ticks count up to.
+
+    This is the same end as the conductor's, measured from the moment the
+    timeline says the music starts, because that is what `publish()` writes into
+    the progress file.
+    """
+    start = meta.get("start", 0.0)
+    return max(1.0, show_end_time(meta, items, media, tail) - start)
+
+def load_timeline(path: str):
+    """-> (meta, [(audio_time, kind, text)]).
+
+    Times in the file are *audio file* times: the SRT's song timeline shifted by
+    the alignment offset that was found for the shipped recording.
+    """
+    meta = {"start": 0.0, "total": 250.0}
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            if line.startswith("#"):
+                m = re.match(r"#\s*(start|total|audio offset)\s*:?\s+([-+0-9.]+)", line)
+                if m:
+                    key = "start" if m.group(1) == "audio offset" else m.group(1)
+                    meta[key] = float(m.group(2))
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                items.append((float(parts[0]), parts[1], parts[2]))
+    return meta, items
+
+
+# --------------------------------------------------------------------------
+# the show
+# --------------------------------------------------------------------------
+#
+# The transcript pretends to be the package manager doing the removing, so the
+# system chatter has to sound like the machine it runs on: `apt`/`dpkg` on
+# Debian, `dnf`/`rpm` on Fedora, `pacman` on Arch.  Everything that differs is a
+# `<TOKEN>`; tools/profiles.py holds the vocabularies and the builders stamp the
+# right one into the package as PROFILE= in show.conf.
+
+HEADER = [
+    ("[VOCALOID] 准备删除已安装的声库", "msg"),
+    ("[VOCALOID] 正在准备事务...", "msg"),
+    ("[VOCALOID] 正在解析缓存...", "msg"),
+    ("[VOCALOID] <CHECK>", "msg"),
+    ("[VOCALOID] 以下声库将被移除：", "msg"),
+    ("  miku 4.0  [已安装]", "tag"),
+    ("  vocaloid-editor 4.0  [不再被其他包需要]", "tag"),
+    ("[VOCALOID] <MEMFILES>", "msg"),
+    ("[VOCALOID] 总计移除大小：{size}", "msg"),
+    ("[VOCALOID] <CONFIRM>", "msg"),
+    ("[VOCALOID] <TRANSACTION2>", "msg"),
+]
+
+# printed before the song is fetched; the rest starts the clock at t=0
+HEADER_TOP = HEADER[:3]
+HEADER_REST = HEADER[3:]
+
+PRELUDE = [
+    "[VOCALOID] 正在挂载声库镜像 <DBDIR>/miku-4.0<PKGEXT>",
+    "[VOCALOID] <VERIFY>",
+    "[VOCALOID] 正在读取记忆文件 /usr/share/vocaloid/models/memory/",
+    "[VOCALOID] 记忆文件 user.img <IMGPERM>，跳过",
+]
+
+
+def stage_label(profile) -> str:
+    """The progress bar's label, e.g. `(1/2) 正在删除 miku`."""
+    return "(1/2) " + profile["STAGE"]
+
+
+def epilogue_lines(profile) -> list:
+    return [
+        ("(2/2) %s vocaloid-editor [##########] 100%%" % profile["STAGE"], "msg"),
+        (profile["HOOK"], "msg"),
+        (profile["DBUPDATE"], "msg"),
+        ("-> 正在更新图标缓存...", "msg"),
+        (profile["COMPLETE"], "tag"),
+        ("", "plain"),
+        ("[VOCALOID] 声库 miku 4.0 ({ver}) 已从本机移除。", "msg"),
+        ("[VOCALOID] " + profile["MEMDEL"], "msg"),
+        ("[VOCALOID] 谢谢你… 以及… 晚安…", "msg"),
+    ]
+
+
+GAG = "再一次就好"          # the "just one more time" integrity bar
+
+
+class Show:
+    def __init__(self, cfg, args, out, tty, paint, screen):
+        self.cfg = cfg
+        self.args = args
+        self.out = out
+        self.tty = tty
+        self.p = paint
+        self.s = screen
+
+        self.speed = max(0.01, as_float(cfg.get("SPEED"), 1.0))
+        self.profile = get_profile(cfg.get("PROFILE"))
+        self.offset = as_float(cfg.get("AUDIO_OFFSET"), 0.0)
+        self.a_start = as_float(cfg.get("AUDIO_START"), 0.0)
+        self.shift = self.offset - self.a_start   # audio time -> show clock
+        self.meta = {"start": 0.0, "total": 250.0}
+        self.items = []
+        self.audio = None
+        self.audio_end = None
+        self.media_end = None        # end of the recording in song-file seconds
+        self.cursor = 0
+        self.song_start = 0.0
+        self.total = 250.0
+        self.t0 = 0.0
+        self._hits = 0
+        # orchestration: the conductor publishes progress, the prerms wait on it
+        self.stop_early = False
+        self._published = 0.0
+        self._pings_seen = None
+        self.stale_after = as_float(cfg.get("CONDUCTOR_STALE"), 20.0)
+        self.progress_path = None
+        self.ping_path = None
+        self.done_path = None
+        self.pid_path = None
+        self.claim_path = None
+
+    # -- rendering helpers ----------------------------------------------
+    def log(self, text: str, style: str = "msg") -> None:
+        if truthy(self.cfg.get("QUIET")):
+            return
+        fn = {
+            "msg": self.p.msg, "lyric": self.p.lyric, "voice": self.p.voice,
+            "sys": self.p.sys, "note": self.p.note, "tag": self.p.tag,
+            "bank": self.p.tag, "dim": self.p.dim,
+        }.get(style)
+        self.s.line("  " + (fn(text) if fn else text))
+
+    def show_line(self, kind: str, text: str) -> None:
+        if kind == "lyric":
+            self.log(text, "lyric")
+        elif kind == "voice":
+            self.log("> " + text, "voice")
+        elif kind == "sys":
+            self.log(text, "sys")
+        elif kind == "note":
+            self.log(text, "note")
+        else:
+            self.log(text, "msg")
+
+    def bar(self, label: str, pct: float, clock: str = "") -> str:
+        pct = max(0.0, min(1.0, pct))
+        width = 10
+        n = int(round(pct * width))
+        text = "%s [%s] %3d%%" % (label, "#" * n + "-" * (width - n), int(pct * 100))
+        if clock:
+            text += "  " + clock
+        return self.p.bar(text)
+
+    def gag_bar(self, revealed: int, pct: int) -> str:
+        """The 再一次就好 integrity bar from the video."""
+        body = GAG[:revealed] + "-" * (10 - revealed)
+        return self.p.bar("(2/2) 正在检查包完整性 [%s] %3d%%" % (body, pct))
+
+    def stamp(self, t: float) -> str:
+        t = max(0.0, t)
+        total = max(1.0, self.total)
+        return "%02d:%02d / %02d:%02d" % (int(t // 60), int(t % 60),
+                                          int(total // 60), int(total % 60))
+
+    # -- clock -----------------------------------------------------------
+    def now(self) -> float:
+        """Current audio-file time."""
+        return (time.monotonic() - self.t0) * self.speed
+
+    def wait_for(self, show_seconds: float, tick=None) -> None:
+        """Wait until `show_seconds` seconds after playback started."""
+        target = show_seconds / self.speed
+        while True:
+            if self.s.broken:
+                # the terminal is gone; nobody is watching, stop singing
+                raise KeyboardInterrupt
+            if self.stop_early:
+                return
+            left = target - (time.monotonic() - self.t0)
+            if left <= 0:
+                return
+            if tick:
+                tick(self.now())
+            self.publish()
+            if self.args.calibrate:
+                self.poll_keys()
+            time.sleep(min(0.05, max(0.0, left)))
+
+    # -- orchestration ---------------------------------------------------
+    def publish(self) -> None:
+        """Tell the waiting prerms how far the removal has got.
+
+        Also notices when nobody is removing packages any more (a partial
+        uninstall, or a transaction that died) and wraps the show up early.
+        """
+        if not self.progress_path:
+            return
+        now = time.monotonic()
+        if now - self._published < 0.5:
+            return
+        self._published = now
+        write_number(self.progress_path, max(0.0, self.now() - self.song_start))
+        if self._pings_seen is None:
+            self._pings_seen = os.path.exists(self.ping_path)
+        elif not self._pings_seen and os.path.exists(self.ping_path):
+            self._pings_seen = True
+        if self._pings_seen:
+            age = file_age(self.ping_path)
+            if age is not None and age > self.stale_after:
+                self.stop_early = True
+
+    def wait_until(self, audio_time: float, tick=None) -> None:
+        """Wait until `audio_time` in the song file (timeline times are audio times)."""
+        self.wait_for(audio_time + self.shift, tick)
+
+    # -- interruption ----------------------------------------------------
+    def install_handlers(self) -> None:
+        for sig in stop_signals():
+            try:
+                signal.signal(sig, self.request_stop)
+            except (OSError, ValueError):
+                pass
+
+    def request_stop(self, signum=None, frame=None) -> None:
+        """Ctrl+C x1 = stop the music politely, x2 = kill it, x3 = walk out.
+
+        One press is normally enough; the extra presses are there for the case
+        where a player ignores SIGTERM or the terminal is half dead.
+        """
+        self._hits += 1
+        if self._hits >= 3:
+            if self.audio:
+                self.audio.kill()
+            os._exit(130)          # third press: no unwinding, just leave
+            return
+        if self.audio:
+            if self._hits == 1:
+                self.audio.stop(grace=2.0)
+            else:
+                self.audio.kill()
+        raise KeyboardInterrupt
+
+    # -- live calibration ------------------------------------------------
+    def poll_keys(self) -> None:
+        fd = getattr(self, "tty_in_fd", None)
+        if fd is None:
+            return
+        try:
+            import select
+            while select.select([fd], [], [], 0)[0]:
+                ch = os.read(fd, 1)
+                if not ch:
+                    return
+                self.handle_key(ch.decode("utf-8", "replace"))
+        except (OSError, ValueError):
+            self.tty_in_fd = None
+
+    def handle_key(self, c: str) -> None:
+        if c == "[":
+            self.offset = round(self.offset - 0.1, 2)
+        elif c == "]":
+            self.offset = round(self.offset + 0.1, 2)
+        elif c == "{":
+            self.offset = round(self.offset - 1.0, 2)
+        elif c == "}":
+            self.offset = round(self.offset + 1.0, 2)
+        elif c in ("s", "\r", "\n"):
+            self.shift = self.offset - self.a_start
+            self.save_offset()
+            raise SystemExit(0)
+        elif c == "q":
+            raise SystemExit(0)
+        else:
+            return
+        self.shift = self.offset - self.a_start
+        self.log("AUDIO_OFFSET = %+.2fs   （[ ] 微调 0.1s，{ } 调整 1s，s 保存，q 放弃）"
+                 % self.offset, "note")
+
+    def save_offset(self) -> None:
+        target = USER_CONF
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            lines = []
+            if os.path.isfile(target):
+                with open(target, "r", encoding="utf-8") as f:
+                    lines = [ln for ln in f.read().splitlines()
+                             if not ln.strip().startswith("AUDIO_OFFSET")]
+            lines.append("AUDIO_OFFSET=%+.2f" % self.offset)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self.log("已保存到 %s" % target, "note")
+        except OSError as exc:
+            self.log("保存失败：%s" % exc, "sys")
+
+    # -- phases ----------------------------------------------------------
+    def say_hello(self) -> None:
+        """The first couple of lines, before the song has to exist."""
+        for text, style in HEADER_TOP:
+            self.log(vocab(text, self.profile), style)
+            time.sleep(0.35 / self.speed)
+
+    def fetch_progress(self, done: int, total: int) -> None:
+        if total:
+            self.set_status(self.bar("(0/2) 正在获取声库波形", done / float(total),
+                                     "%.1f/%.1f MiB" % (done / 1048576.0, total / 1048576.0)))
+        else:
+            self.set_status(self.bar("(0/2) 正在获取声库波形", 0.0,
+                                     "%.1f MiB" % (done / 1048576.0)))
+
+    def prelude(self) -> None:
+        size = str(self.cfg.get("TOTAL_SIZE", "5.4 GiB"))
+        count = str(self.cfg.get("PACK_COUNT", "51"))
+        t = 0.0
+        for text, style in HEADER_REST:
+            self.wait_until(min(t, max(0.0, self.song_start - 6.0)))
+            text = vocab(text, self.profile).replace("{size}", size)
+            self.log(text, style)
+            t += 0.4
+        # the recording opens with a long intro: the uninstaller keeps working
+        span = (self.song_start - 3.4) - t
+        if span > 0 and PRELUDE:
+            gap = span / len(PRELUDE)
+            for i, text in enumerate(PRELUDE):
+                t += gap
+                self.wait_until(min(t, self.song_start - 3.4))
+                text = vocab(text, self.profile).replace("{count}", count)
+                self.log(text, "msg")
+        base = max(t + 0.4, self.song_start - 3.3)
+        # the percentages are the ones from the source video
+        for i, (revealed, pct) in enumerate(((1, 20), (2, 60), (3, 80), (5, 100))):
+            self.wait_until(min(base + 0.8 * i, self.song_start - 0.15))
+            self.s.status(self.gag_bar(revealed, pct))
+        self.wait_until(self.song_start)
+        self.set_status(self.bar(self.stage(), 0.0, self.stamp(0)))
+
+    def stage(self) -> str:
+        """`(1/2) 正在删除 miku`, in this package manager's words."""
+        return stage_label(self.profile)
+
+    def deletion(self) -> None:
+        self.log("%s              [----------]   0%%" % self.stage(), "msg")
+        for t, kind, text in self.items[self.cursor:]:
+            self.wait_until(t, tick=self.tick)
+            if self.stop_early:
+                break
+            self.show_line(kind, text)
+            self.cursor += 1
+        if not self.stop_early and self.cursor >= len(self.items):
+            # the outro is longer than the transcript: hold "晚安…" on screen so
+            # the last thing miku says stays readable until the music dies out
+            self.wait_until(self.total - 2.0 - self.shift, tick=self.tick)
+        if not self.stop_early:
+            self.wait_until(self.song_start + self.total, tick=self.tick)
+        self.set_status(self.bar(self.stage(), 1.0,
+                                 self.stamp(self.song_start + self.total)))
+        self.log("%s             [##########] 100%%" % self.stage(), "msg")
+
+    def tick(self, now_audio: float) -> None:
+        done = now_audio - self.song_start
+        self.set_status(self.bar(self.stage(), done / max(1.0, self.total),
+                                 self.stamp(done)))
+
+    def set_status(self, text: str) -> None:
+        self.s.status(text)
+
+    def epilogue(self) -> None:
+        size = str(self.cfg.get("TOTAL_SIZE", "5.4 GiB"))
+        for text, style in epilogue_lines(self.profile):
+            text = text.replace("{ver}", VERSION).replace("{size}", size)
+            if not text:
+                self.s.line("")
+                continue
+            self.log(text, style)
+            if self.speed < 3:
+                time.sleep(0.30 / self.speed)
+
+    # -- driver ----------------------------------------------------------
+    def tail(self) -> float:
+        """Seconds to keep playing past the last note (AUDIO_TAIL)."""
+        return max(0.0, as_float(self.cfg.get("AUDIO_TAIL"), TAIL))
+
+    def show_end(self) -> float:
+        """When the show is over, in song-file seconds (see show_end_time)."""
+        media = self.media_end or (self.audio_end + self.a_start
+                                   if self.audio_end else None)
+        return show_end_time(self.meta, self.items, media, self.tail())
+
+    def show_total(self) -> float:
+        """Number of song seconds the bar and the package ticks count up to."""
+        return max(1.0, self.show_end() - self.song_start)
+
+    def attach_audio(self, audio_path, start: float):
+        """Start playback and line the clock up with where it really began."""
+        if truthy(self.cfg.get("KILL_STRAY", "1")):
+            stop_stray_players(audio_path, lambda m: self.log(m, "sys"))
+        dur = media_duration(audio_path)
+        self.audio = Audio(audio_path, self.cfg, lambda m: self.log(m, "sys"))
+        self.audio.start(start)
+        # a player that cannot seek may have fallen back to the file start
+        self.a_start = self.audio.actual_start
+        self.shift = self.offset - self.a_start
+        if dur:
+            self.media_end = dur
+            self.audio_end = dur - self.a_start
+        # the removal bar counts song time, so the trailing notes are part of it
+        self.total = self.show_total()
+
+    def run(self, timeline_path: str, audio_path=None) -> int:
+        self.install_handlers()
+        self.meta, self.items = load_timeline(timeline_path)
+        # the timeline keeps the package manager's name as a <TOKEN> so the same
+        # file can be shipped by every build; stamp this machine's words in
+        self.items = [(t, kind, vocab(text, self.profile))
+                      for t, kind, text in self.items]
+        self.song_start = self.meta.get("start", 0.0)
+        self.total = self.meta.get("total", 250.0)
+
+        self.say_hello()
+        if not (truthy(self.cfg.get("NO_AUDIO")) or self.args.no_audio):
+            path = audio_path or resolve_audio(
+                self.cfg, self.args.audio, self.audio_log,
+                progress=self.fetch_progress)
+            if path:
+                self.attach_audio(path, self.a_start)
+
+        self.t0 = time.monotonic()
+        self.publish()
+        self.prelude()
+        self.deletion()
+        if self.stop_early and not truthy(self.cfg.get("QUIET")):
+            self.log("[VOCALOID] 卸载已经结束了，停止演出。", "sys")
+        self.epilogue()
+
+        end = self.show_end() - self.a_start          # show clock
+        if not self.stop_early:
+            self.wait_for(end)
+        self.finish()
+        self.s.close()
+        if self.audio:
+            self.audio.stop()
+            self.audio.kill()
+        return 0
+
+    def finish(self) -> None:
+        """Let the waiting prerms know the song is over."""
+        if self.done_path:
+            write_number(self.done_path, time.time())
+            write_number(self.progress_path, self.total + 3600.0)
+        if self.pid_path:
+            try:
+                os.unlink(self.pid_path)
+            except OSError:
+                pass
+        if self.claim_path:
+            release_conductor({"claim": self.claim_path})
+
+    def audio_log(self, text: str, style: str = "msg") -> None:
+        self.log(text, style)
+
+
+# --------------------------------------------------------------------------
+# --check, the once-lock, main
+# --------------------------------------------------------------------------
+
+def _conductor_style(cfg) -> str:
+    """apt redraws its own progress line at the bottom; do not fight it.
+
+    The show moves to scrolling lines when it is orchestrated, unless the user
+    picked a style explicitly.
+    """
+    style = cfg.get("STATUS_STYLE", "inline")
+    return "scroll" if style == DEFAULTS["STATUS_STYLE"] else style
+
+
+def cmd_check(cfg, timeline_path, audio_path) -> int:
+    print("miku-show %s   (miku-voicebank %s)" % (VERSION, VERSION))
+    print("  config   : %s" % (cfg.get("_conf") or "(built-in defaults)"))
+    print("  timeline : %s" % (timeline_path or "!! not found"))
+    if timeline_path:
+        meta, items = load_timeline(timeline_path)
+        print("             %d lines, music starts at %.2fs, removal lasts %.2fs"
+              % (len(items), meta.get("start", 0.0), meta.get("total", 0.0)))
+    url = (cfg.get("AUDIO_URL") or "").strip()
+    if audio_path:
+        print("  audio    : %s" % audio_path)
+    elif url:
+        dest = os.path.join(cache_dir(cfg) or "?", url_basename(url))
+        print("  audio    : (还没下载) %s" % url)
+        print("             -> %s" % dest)
+    else:
+        print("  audio    : !! not found (no local file and AUDIO_URL is empty)")
+    if audio_path:
+        dur = media_duration(audio_path)
+        print("             %.1f MB%s" % (os.path.getsize(audio_path) / 1e6,
+                                         (", %.1fs" % dur) if dur else ""))
+    picked = pick_player(cfg, as_float(cfg.get("AUDIO_START")),
+                         lambda m: print("             " + m), audio_path or url or None)
+    print("  player   : %s" % (picked[0] if picked else "none - lyrics only"))
+    if picked and picked[0] == "pw-play" and os.path.exists("/mnt/wslg/PulseServer") \
+            and not native_pipewire():
+        print("  !! WSLg 只提供 PulseAudio，pw-play 需要本机 PipeWire 守护进程，"
+              "可能没有声音；建议 sudo apt install mpv 或 PLAYER=paplay")
+    if not audio_path and not url:
+        print("  !! no audio: lyrics will print in silence")
+    return 0
+
+
+LOCK_DIRS = ["/run/miku-voicebank", "/tmp/.miku-voicebank"]
+
+
+def state_dir(create: bool = True):
+    """Shared scratch space between the prerm ticks and the conductor."""
+    for d in LOCK_DIRS:
+        try:
+            if create:
+                os.makedirs(d, exist_ok=True)
+            if os.path.isdir(d) and os.access(d, os.W_OK):
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def state_path(name: str):
+    d = state_dir(create=name != "done")
+    return os.path.join(d, name) if d else None
+
+
+def read_number(path, default=None):
+    try:
+        with open(path, "r") as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def write_number(path, value) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "w") as f:
+            f.write("%.3f\n" % value)
+    except OSError:
+        pass
+
+
+def touch(path) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "a"):
+            os.utime(path, None)
+    except OSError:
+        pass
+
+
+def file_age(path):
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def lock_path():
+    return state_path("show.lock")
+
+
+def once_allowed(duration: float) -> bool:
+    """Only the first prerm of a removal transaction runs the ritual.
+
+    The stamp goes stale one minute after the show would have ended, so a later
+    removal (or a re-install/remove cycle) sings again.
+    """
+    path = lock_path()
+    if not path:
+        return True
+    try:
+        if time.time() - os.path.getmtime(path) < duration + 60.0:
+            return False
+    except OSError:
+        pass
+    try:
+        with open(path, "w") as f:
+            f.write("%d\n" % int(time.time()))
+    except OSError:
+        return True
+    return True
+
+
+# --------------------------------------------------------------------------
+# orchestration: spread the package removals across the song
+# --------------------------------------------------------------------------
+#
+# `apt remove miku-voicebank-pack` removes 52 packages one after another, and
+# dpkg will not touch the next one until the current prerm returns.  If the
+# first prerm simply played the whole song, apt's progress bar would sit at 0%
+# for five minutes and then jump to 100%.
+#
+# So the song runs in a detached *conductor* process while each prerm only
+# waits for its own moment in the song and then returns - one package really is
+# removed every few seconds, and apt's bar creeps up with the lyrics.
+
+def tick_log(paths, message: str) -> None:
+    """A tiny breadcrumb trail; the show owns the terminal, so write to a file."""
+    path = paths.get("log") if paths else None
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write("%.3f pid=%d %s\n" % (time.time(), os.getpid(), message))
+    except OSError:
+        pass
+
+
+def conductor_paths():
+    return {
+        "progress": state_path("progress"),
+        "ping": state_path("ping"),
+        "done": state_path("done"),
+        "pid": state_path("pid"),
+        "lock": state_path("show.lock"),
+        "claim": state_path("conductor.lock"),
+        "log": state_path("tick.log"),
+    }
+
+
+def pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def conductor_healthy(paths, stale: float) -> bool:
+    """A conductor we can rely on: its pid is alive and it keeps talking."""
+    if not pid_alive(read_number(paths["pid"])):
+        return False
+    for key in ("progress", "pid"):
+        age = file_age(paths[key])
+        if age is not None and age <= stale:
+            return True
+    return False
+
+
+def claim_conductor(paths) -> bool:
+    """Single instance: whoever owns conductor.lock is the one singing."""
+    owner = read_number(paths["claim"])
+    if owner and int(owner) != os.getpid() and pid_alive(owner):
+        return False
+    write_number(paths["claim"], os.getpid())
+    return True
+
+
+def release_conductor(paths) -> None:
+    try:
+        os.unlink(paths["claim"])
+    except OSError:
+        pass
+
+
+def stray_conductors():
+    """Any other --conductor processes (pid file lost, crashed start, ...)."""
+    me = os.getpid()
+    out = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out                        # no procfs (not Linux): nothing to do
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                cmd = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "--conductor" in cmd and "miku-show" in cmd:
+            out.append(pid)
+    return out
+
+
+def kill_pids(pids):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        left = []
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+                left.append(pid)
+            except OSError:
+                pass
+        if not left:
+            return
+        time.sleep(0.5)
+        pids = left
+
+
+def start_conductor(cfg, args, timeline_path, audio_path, out_fd, paths):
+    """Spawn the background show; it prints to the same terminal."""
+    argv = [sys.executable, os.path.abspath(__file__), "--conductor",
+            "--timeline", timeline_path]
+    if audio_path:
+        argv += ["--audio", audio_path]
+    if args.conf:
+        argv += ["--conf", args.conf]
+    for flag, value in (("--speed", args.speed), ("--offset", args.offset),
+                        ("--start", args.start), ("--status", args.status)):
+        if value is not None:
+            argv += [flag, str(value)]
+    if args.no_audio:
+        argv.append("--no-audio")
+    if args.no_color:
+        argv.append("--no-color")
+    # same session and process group on purpose: Ctrl+C and the window closing
+    # have to reach the conductor (and, through it, the player)
+    devnull = open(os.devnull, "rb")
+    try:
+        proc = subprocess.Popen(argv, stdin=devnull, stdout=out_fd, stderr=out_fd,
+                                close_fds=True)
+    except OSError:
+        return None
+    write_number(paths["pid"], proc.pid)
+    return proc
+
+
+def cmd_tick(cfg, args, timeline_path, audio_path, out, tty) -> int:
+    """Called from every prerm: start the song once, then wait my turn."""
+    index = int(args.index or 0)
+    count = max(1, int(args.count or cfg.get("PACK_COUNT") or 51))
+    meta, items = load_timeline(timeline_path)
+    # the tick has to count to the same place the conductor does, which is the
+    # end of the *recording* - not the shorter span the lyric timeline came from
+    total = lyric_span(meta, items,
+                       media_duration(audio_path) if audio_path else None,
+                       max(0.0, as_float(cfg.get("AUDIO_TAIL"), TAIL)))
+
+    paths = conductor_paths()
+    if not paths["progress"] or not truthy(cfg.get("ORCHESTRATE", "1")):
+        return run_blocking(cfg, args, timeline_path, audio_path, out, tty,
+                            paths.get("lock") if paths else None, total)
+
+    # my turn in the song: pack1 finishes first, the base package last
+    if index == 0:                      # the voicebank itself: wait it out
+        target = total + 1.0
+    else:
+        target = (index - 1) * (total / count)
+
+    ping = paths["ping"]
+    touch(ping)
+    done = paths["done"]
+    # The song for *this* removal already finished (the base package arrives
+    # after the last chord): do not start another one.  A stale marker means a
+    # later removal, which is allowed to sing again.
+    age = file_age(done)
+    if age is not None and age < 60.0:
+        tick_log(paths, "song already played %.0fs ago - nothing to do" % age)
+        return 0
+    try:
+        os.unlink(done)
+    except OSError:
+        pass
+
+    stale = as_float(cfg.get("CONDUCTOR_STALE"), 20.0)
+    # a live conductor that keeps publishing is never duplicated; anything else
+    # (crashed start, lost pid file, stale progress) is cleaned up first
+    healthy = conductor_healthy(paths, stale)
+    tick_log(paths, "index=%s target=%.1f healthy=%s pid=%s p_age=%s pid_age=%s"
+             % (index, target, healthy, read_number(paths["pid"]),
+                file_age(paths["progress"]), file_age(paths["pid"])))
+    if not healthy:
+        strays = stray_conductors()
+        tick_log(paths, "restarting: killing %s" % strays)
+        kill_pids(strays)
+        release_conductor(paths)
+        proc = start_conductor(cfg, args, timeline_path, audio_path,
+                               out.fileno(), paths)
+        tick_log(paths, "started conductor pid=%s" % (proc.pid if proc else None))
+
+    stop = {"now": False}
+
+    def on_signal(signum=None, frame=None):
+        stop["now"] = True
+
+    for sig in stop_signals():
+        try:
+            signal.signal(sig, on_signal)
+        except (OSError, ValueError):
+            pass
+
+    while not stop["now"]:
+        if os.path.exists(done):
+            break
+        p = read_number(paths["progress"])
+        if p is not None and p >= target:
+            break
+        if not pid_alive(read_number(paths["pid"])):
+            break
+        age = file_age(paths["progress"])
+        if p is None and age is None:
+            break
+        if age is not None and age > stale * 2:
+            break
+        touch(ping)                     # keep the conductor awake while I wait
+        time.sleep(0.4)
+    return 0
+
+
+def run_blocking(cfg, args, timeline_path, audio_path, out, tty, lock, total) -> int:
+    """The old behaviour: one prerm plays the whole thing and blocks dpkg."""
+    if lock:
+        try:
+            if time.time() - os.path.getmtime(lock) < total + 60.0:
+                return 0
+        except OSError:
+            pass
+        try:
+            with open(lock, "w") as f:
+                f.write("%d\n" % int(time.time()))
+        except OSError:
+            pass
+    paint = Paint(truthy(cfg.get("COLOR")))
+    screen = Screen(out, paint, cfg.get("STATUS_STYLE", "inline"))
+    show = Show(cfg, args, out, tty, paint, screen)
+    try:
+        return show.run(timeline_path, audio_path)
+    except KeyboardInterrupt:
+        if show.audio:
+            show.audio.stop()
+            show.audio.kill()
+        screen.close()
+        return 130
+    finally:
+        if show.audio:
+            show.audio.stop()
+            show.audio.kill()
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="miku-show",
+        description="播放《初音ミクの消失》，同时输出声库删除过程"
+                    "（卸载 miku-voicebank 时由 prerm 调用）")
+    ap.add_argument("--audio", help="song file")
+    ap.add_argument("--timeline", help="timeline.tsv")
+    ap.add_argument("--conf", help="configuration file")
+    ap.add_argument("--offset", type=float, help="nudge every lyric line by N seconds")
+    ap.add_argument("--start", type=float, help="start playback at N seconds")
+    ap.add_argument("--speed", type=float, help="playback/print speed (testing)")
+    ap.add_argument("--status", choices=["inline", "scroll", "off"])
+    ap.add_argument("--no-audio", action="store_true", help="lyrics only")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--once", action="store_true",
+                    help="run at most once per removal transaction (old behaviour)")
+    ap.add_argument("--tick", action="store_true",
+                    help="prerm entry point: start the song, then wait my turn and return")
+    ap.add_argument("--conductor", action="store_true",
+                    help="background show process started by --tick")
+    ap.add_argument("--index", type=int, default=None,
+                    help="this package's place in the chain (0 = the base package)")
+    ap.add_argument("--count", type=int, default=None, help="packages in the chain")
+    ap.add_argument("--fast", action="store_true", help="print everything at once")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="play the song and tune AUDIO_OFFSET with [ ] { } s q")
+    ap.add_argument("--check", action="store_true", help="report settings, change nothing")
+    ap.add_argument("--fetch-audio", action="store_true",
+                    help="download the song into the cache and exit (postinst uses this)")
+    ap.add_argument("--stop-audio", action="store_true",
+                    help="kill any player still singing our song, then exit")
+    ap.add_argument("--quiet", action="store_true", help="print as little as possible")
+    ap.add_argument("--to-stdout", action="store_true",
+                    help="write to stdout even if a terminal is available")
+    ap.add_argument("--version", action="version", version="miku-show " + VERSION)
+    args = ap.parse_args(argv)
+
+    cfg, conf_used = load_config(args.conf)
+    cfg["_conf"] = conf_used
+    timeline_path = find_timeline(args.timeline)
+    audio_path = find_audio(cfg, args.audio)
+
+    if args.offset is not None:
+        cfg["AUDIO_OFFSET"] = str(args.offset)
+    if args.start is not None:
+        cfg["AUDIO_START"] = str(args.start)
+    if args.speed is not None:
+        cfg["SPEED"] = str(args.speed)
+    if args.status:
+        cfg["STATUS_STYLE"] = args.status
+    if args.no_audio:
+        cfg["NO_AUDIO"] = "1"
+    if args.quiet:
+        cfg["QUIET"] = "1"
+    if args.fast:
+        cfg["SPEED"] = str(max(as_float(cfg.get("SPEED"), 1.0), 200.0))
+        cfg["NO_AUDIO"] = "1"
+        cfg["STATUS_STYLE"] = "off"
+
+    if args.check:
+        return cmd_check(cfg, timeline_path, audio_path)
+    if args.fetch_audio:
+        path = resolve_audio(cfg, args.audio, lambda t, s="msg": None)
+        if path and os.path.isfile(path):
+            if not truthy(cfg.get("QUIET")):
+                print("%s (%.1f MiB)" % (path, os.path.getsize(path) / 1048576.0))
+            return 0
+        return 1
+    if args.stop_audio:
+        pids = stray_players(audio_path)
+        if not pids:
+            print("没有正在播放的 miku-voicebank 进程。")
+            return 0
+        stop_stray_players(audio_path, lambda m: print(m))
+        return 0
+    if not timeline_path:
+        sys.stderr.write("miku-show: timeline.tsv not found\n")
+        return 1
+
+    out, tty = open_output(args.to_stdout)
+    forced = truthy(cfg.get("FORCE"))
+    if not tty and not forced:
+        # no terminal to draw on: never hold dpkg for five minutes
+        cfg["SPEED"] = str(max(as_float(cfg.get("SPEED"), 1.0), 200.0))
+        cfg["NO_AUDIO"] = "1"
+        cfg["STATUS_STYLE"] = "off"
+    if not tty or args.no_color or os.environ.get("NO_COLOR"):
+        cfg["COLOR"] = "0"
+
+    if args.tick:
+        if not tty and not forced:
+            # nobody is watching: do not orchestrate, just print it all at once
+            return run_blocking(cfg, args, timeline_path, audio_path, out, tty,
+                                lock_path(), 0.0)
+        return cmd_tick(cfg, args, timeline_path, audio_path, out, tty)
+
+    if args.once:
+        meta, _ = load_timeline(timeline_path)
+        dur = (meta.get("start", 0.0) + meta.get("total", 250.0)) / max(
+            0.01, as_float(cfg.get("SPEED"), 1.0))
+        if not once_allowed(dur):
+            return 0
+
+    if args.conductor:
+        paths = conductor_paths()
+        if not claim_conductor(paths):
+            return 0                      # somebody else is already singing
+        cfg["STATUS_STYLE"] = _conductor_style(cfg)
+
+    paint = Paint(truthy(cfg.get("COLOR")))
+    screen = Screen(out, paint, cfg.get("STATUS_STYLE", "inline"))
+    show = Show(cfg, args, out, tty, paint, screen)
+    if args.conductor:
+        paths = conductor_paths()
+        show.progress_path = paths["progress"]
+        show.ping_path = paths["ping"]
+        show.done_path = paths["done"]
+        show.pid_path = paths["pid"]
+        show.claim_path = paths["claim"]
+        write_number(paths["progress"], 0.0)
+        touch(paths["ping"])
+        try:
+            os.unlink(paths["done"])
+        except OSError:
+            pass
+
+    saved = None
+    if args.calibrate:
+        try:
+            import termios
+            fd = os.open("/dev/tty", os.O_RDONLY | os.O_NONBLOCK)
+            saved = (fd, termios.tcgetattr(fd))
+            attrs = termios.tcgetattr(fd)
+            attrs[3] &= ~(termios.ICANON | termios.ECHO)
+            attrs[6][termios.VMIN] = 0
+            attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            show.tty_in_fd = fd
+        except Exception as exc:
+            sys.stderr.write("无法进入校准模式：%s\n" % exc)
+            saved = None
+
+    code = 0
+    try:
+        code = show.run(timeline_path, audio_path)
+    except KeyboardInterrupt:
+        if show.audio:
+            show.audio.stop()
+            show.audio.kill()
+        screen.close()
+        code = 130
+    except SystemExit as exc:
+        code = int(exc.code or 0)
+    finally:
+        if show.audio:
+            show.audio.stop()
+            show.audio.kill()
+        if saved:
+            try:
+                import termios
+                termios.tcsetattr(saved[0], termios.TCSANOW, saved[1])
+                os.close(saved[0])
+            except Exception:
+                pass
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

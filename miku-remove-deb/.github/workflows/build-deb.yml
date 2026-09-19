@@ -3,14 +3,8 @@ name: build-deb
 on:
   push:
     branches: [main]
-    paths: ["miku-remove-deb/**", ".github/workflows/build-deb.yml"]
   pull_request:
-    paths: ["miku-remove-deb/**", ".github/workflows/build-deb.yml"]
   workflow_dispatch:
-
-defaults:
-  run:
-    working-directory: miku-remove-deb
 
 jobs:
   build:
@@ -23,9 +17,7 @@ jobs:
           python-version: "3.x"
 
       - name: self test
-        run: |
-          python3 tests/test_show.py
-          python3 tests/test_tick.py
+        run: python3 tests/test_show.py
 
       - name: build the package chain
         run: |
@@ -40,5 +32,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: miku-voicebank-debs
-          path: miku-remove-deb/dist/*.deb
+          path: dist/*.deb
           retention-days: 30
