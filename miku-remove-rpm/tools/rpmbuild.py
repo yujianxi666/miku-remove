@@ -1,19 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""A minimal, dependency-free RPM writer.
+"""A minimal, dependency-free RPM writer — development reference only.
 
-Only what `miku-remove-rpm` needs: a noarch package with a gzip-compressed cpio
-payload, a few scriptlets, plain file metadata and `Requires` lines.  Written
-against the on-disk format (lead + signature header + main header + payload) so
-the packages can be produced on any machine, not just on Fedora.
+Production packages are written by **rpmbuild** (see tools/build_rpm.py): the
+header/region/signature invariants below are subtle enough that rpm is the only
+trustworthy judge of the result.  This module keeps a readable description of
+the format (and can emit a package for inspection with `python3
+tools/rpmbuild.py`), which is useful when reading a hex dump, but its output is
+*not* accepted by rpm 6 - do not ship it.
+
+What the format actually requires (learned the hard way from rpm 6.0.2):
+
+  * the header magic is the four bytes `8e ad e8 01`; rpm compares all four, so a
+    header written with version 0 fails as "hdr magic: BAD";
+  * the signature header must be wrapped in a region: the first index entry is
+    RPMTAG_HEADERSIGNATURES (62), type BIN, count 16 (REGION_TAG_COUNT), and the
+    region trailer sits at `dl - 16` with count 16 and a negative offset of
+    `-16 * entries` (rpm derives the region's index length from it);
+  * every entry's offset must be a multiple of its type's alignment (4 for
+    INT32), and the index has to stay sorted by tag after the region entry is
+    prepended - rpm pairs entries with offsets by position;
+  * the SHA1/SHA256 entries in the signature header are hex *strings* of the
+    **main header** (magic + il + dl + index + store), not of the payload;
+  * FILERDEVS is INT16, not INT32;
+  * the region's data is walked with "length to the next offset" semantics, so
+    there must be no stray padding between entries or before the trailer.
 
     rpm = Rpm(name="hello", version="1.0", release="1", summary="...",
               description="...", files=[RpmFile("/usr/bin/hello", data, 0o755)],
               requires=["/bin/sh"], scriptlets={"preun": "..."})
     open("hello-1.0-1.noarch.rpm", "wb").write(rpm.build())
-
-The result is a normal rpm: `rpm -qpi`, `dnf install` and `rpm -qpl` all read
-it, and `rpm -qp --scripts` shows the scriptlets back.
 """
 
 from __future__ import annotations
@@ -59,6 +75,8 @@ T_PROVIDEVERSION = 1048
 T_REQUIRENAME = 1049
 T_REQUIREVERSION = 1050
 T_RPMVERSION = 1064
+T_HEADERSIGNATURES = 62        # region tag of the signature header
+T_HEADERIMMUTABLE = 63         # region tag of the main header
 T_LICENSE = 1014
 T_VENDOR = 1011
 T_PACKAGER = 1015
@@ -98,6 +116,13 @@ T_STRING, T_BIN, T_STRING_ARRAY, T_I18NSTRING = 6, 7, 8, 9
 
 DEFAULT_MTIME = 1234567890
 
+#: how each rpm type has to be aligned inside the header store
+#: (rpm's `typeAlign`: 1 for strings, 4 for INT32, 8 for INT64, ...)
+_TYPE_ALIGN = {
+    T_NULL: 1, T_CHAR: 1, 2: 1, T_INT16: 2, T_INT32: 4, 5: 8,
+    T_STRING: 1, T_BIN: 1, T_STRING_ARRAY: 1, T_I18NSTRING: 1,
+}
+
 
 class RpmFile:
     """One file in the payload."""
@@ -117,11 +142,21 @@ def _align8(n):
 
 
 class _Header:
-    """Collects tags and serialises them as an rpm header structure."""
+    """Collects tags and serialises them as an rpm header structure.
 
-    def __init__(self, region=False):
+    `region` wraps the header in an immutable region: the signature header *has*
+    to be wrapped (rpm rejects a package whose signature has no region), and the
+    main header is wrapped too, the way every real package is.
+    """
+
+    def __init__(self, region=False, signature=True):
         self.entries = {}
         self.region = region
+        #: which region tag to use: 62 for the signature header, 63 for the
+        #: main header's immutable region
+        self.signature = signature
+        self.region_tag = (T_HEADERSIGNATURES if signature
+                           else T_HEADERIMMUTABLE)
 
     def add(self, tag, etype, values):
         if etype in (T_STRING, T_I18NSTRING, T_STRING_ARRAY):
@@ -155,17 +190,36 @@ class _Header:
     def align8(self):
         """Grow the store so the whole header is a multiple of 8 bytes.
 
-        rpm wants the signature header to end on an 8-byte boundary, and the
-        padding has to be *inside* the header's store: any bytes sitting between
-        two headers make readers treat them as the start of the next header.
+        rpm wants the signature header to end on an 8-byte boundary.  The padding
+        goes *inside* the store - bytes between the two headers would be read as
+        the start of the next one - and with a region it goes in front of the
+        trailer, which has to stay the last thing in the store.
         """
-        total = 16 + 16 * len(self.entries) + len(self._store_bytes())
-        pad = (-total) % 8
+        pad = (-self.total_size()) % 8
+        if pad:
+            self._tail = getattr(self, "_tail", b"") + b"\0" * pad
+        return self
+
+    def total_size(self) -> int:
+        """Bytes this header will occupy once serialised."""
+        index_len = 16 * len(self.entries)
+        if self.region:
+            index_len += 16                     # the region entry itself
+        fixed = 16 + index_len + (16 if self.region else 0)   # + the trailer
+        return fixed + len(self._store_bytes())
+
+    def compute_pad(self, want: int):
+        """Grow the store so the serialised header is exactly `want` bytes."""
+        pad = want - self.total_size()
+        if pad < 0 or pad % 8:
+            raise ValueError("header of %d bytes cannot reach %d"
+                             % (self.total_size(), want))
         if pad:
             self._tail = getattr(self, "_tail", b"") + b"\0" * pad
         return self
 
     def _store_bytes(self):
+        """The tag store, without the region trailer."""
         store = bytearray()
         for tag in sorted(self.entries):
             etype, values = self.entries[tag]
@@ -196,12 +250,44 @@ class _Header:
             return bytes(v & 0xFF for v in values)
         raise ValueError("entry type %d not supported" % etype)
 
+    def _region_trailer(self, offset, nindex: int, store_size: int) -> bytes:
+        """The 16-byte "region trailer" entry that closes the store.
+
+        Both headers keep count == REGION_TAG_COUNT (16) and a negative offset of
+        -16 * entries; the *region entry* is what differs between them (see
+        `build`): rpm's verify pass wants 16 there, its import pass takes the
+        region's data length from it.
+        """
+        del offset, store_size
+        tag = self.region_tag
+        return struct.pack(self.ENDIAN + "IiiI", tag, T_BIN,
+                           -16 * nindex, 16)
+
     def build(self) -> bytes:
+        """Serialise the header.
+
+        The store is written in *tag order* and each entry's offset is the byte
+        just written, so the offsets increase together with the tags and the data
+        is contiguous.  rpm requires exactly that inside a region; a "packed"
+        layout (data appended in whatever order, offsets pointing into the
+        middle of other entries) fails its per-tag sanity check with
+
+            tag[6]: BAD, tag 1009 type 4 offset 426 count 1 len 357
+        """
         tags = sorted(self.entries)
         store = bytearray()
         index = []
         for tag in tags:
             etype, values = self.entries[tag]
+            if etype != T_NULL:
+                # rpm validates the offset of every entry against the type's
+                # alignment (`hdrchkAlign`: offset must be a multiple of 4 for
+                # an INT32, 2 for an INT16, ...).  A misaligned INT32 is
+                # reported as "signature tag[2]: BAD, tag 1000 type 4 offset
+                # 106 count 1 len 65", so pad up to the type's size.
+                align = _TYPE_ALIGN.get(etype, 1)
+                while len(store) % align:
+                    store += b"\0"
             offset = len(store)
             if etype != T_NULL:
                 chunk = self._store(etype, values)
@@ -213,10 +299,60 @@ class _Header:
             else:
                 count = len(values)
             index.append((tag, etype, offset, count))
-        store += getattr(self, "_tail", b"")
+
+        if self.region:
+            # Wrap the header in an immutable region: the store is
+            #     [tag data][region trailer]
+            # with a region entry in front of the index.  rpm needs this on the
+            # signature header, and its main-header bookkeeping assumes it too.
+            #
+            # The store is laid out so that every entry's data is followed
+            # *immediately* by the next entry (and the last one by the trailer).
+            # rpm walks the region in "fast" mode, where a string entry's length
+            # is `next offset - this offset`, and it then demands
+            #     sum(lengths) + 16 == header data length.
+            # A stray padding byte between two entries, or between the last entry
+            # and the trailer, breaks that sum and rpm reports either
+            # "tag[N]: BAD ... len X" or "hdr load: BAD".  So the alignment
+            # padding is written in front of the entry that needs it, and the
+            # final block is padded by extending the last string's data.
+            tag = self.region_tag
+            tail = getattr(self, "_tail", b"")
+            store += tail
+            data_end = len(store) + 16               # the trailer goes last
+            if data_end % 16:
+                data_end += 16 - (data_end % 16)
+            gap = data_end - 16 - len(store)
+            if gap and index:
+                store += b"\0" * gap
+                last = index[-1]
+                if last[1] in (T_STRING, T_STRING_ARRAY, T_I18NSTRING, T_BIN):
+                    # the extra NULs are simply more string terminators, so the
+                    # entry (and therefore the region total) still matches
+                    index[-1] = (last[0], last[1], last[2], last[3] + gap)
+            elif gap:
+                store += b"\0" * gap
+            trailer_at = data_end - 16
+            store += self._region_trailer(trailer_at, len(index) + 1,
+                                          trailer_at + 16)
+            index.insert(0, (tag, T_BIN, trailer_at, 16))
+            # rpm pairs index entries with store offsets *by position*, so after
+            # prepending the region the rest has to go back into ascending tag
+            # order - otherwise every tag gets the wrong offset and rpm reports
+            # "signature tag[2]: BAD, tag 1000 type 4 offset 106 count 1 len 65".
+            index[1:] = sorted(index[1:], key=lambda e: e[0])
+        else:
+            store += getattr(self, "_tail", b"")
+
         body = b"".join(struct.pack(self.ENDIAN + "IIII", *e) for e in index)
         # magic(3) + version(1) + reserved(4) + nindex(4) + storesize(4) = 16
-        hdr = (HEADER_MAGIC + b"\x00" * 5
+        #
+        # The version byte must be 1 in *both* headers: rpm's magic constant is
+        # the four bytes 8e ad e8 01, and rpmReadHeader() compares four of them,
+        # so a header written with version 0 is reported as
+        #     "hdr magic: BAD"  /  "signature hdr magic: BAD"
+        # even though the first three bytes look perfect in a hex dump.
+        hdr = (HEADER_MAGIC + b"\x01" + b"\x00" * 4
                + struct.pack(self.ENDIAN + "II", len(index), len(store)))
         out = hdr + body + bytes(store)
         assert len(out) == 16 + 16 * len(index) + len(store), (len(out), len(store))
@@ -353,7 +489,7 @@ class Rpm:
             devices.append(1)
             langs.append("")
 
-        h = _Header()
+        h = _Header(region=True, signature=False)
         h.i18n(T_HEADERI18NTABLE, "C")
         h.string(T_NAME, self.name)
         h.string(T_VERSION, self.version)
@@ -375,7 +511,9 @@ class Rpm:
         h.string(T_PAYLOADFORMAT, "cpio")
         h.string(T_PAYLOADCOMPRESSOR, "gzip")
         h.string(T_PAYLOADFLAGS, "9")
-        h.binary(T_PAYLOADDIGEST, hashlib.sha256(compressed).digest())
+        # (no RPMTAG_PAYLOADDIGEST here: rpm's own region walker flags the last
+        # blob entry of an immutable region as "tag[40]: BAD ... len 2", and the
+        # payload MD5 in the signature header already covers integrity.)
 
         names_all = [n for n, _ in members]
         h.strings(T_BASENAMES, basenames)
@@ -388,7 +526,10 @@ class Rpm:
         h.int32(T_FILEFLAGS, flags)
         h.strings(T_FILEUSERNAME, ["root"] * len(names_all))
         h.strings(T_FILEGROUPNAME, ["root"] * len(names_all))
-        h.int32(T_FILERDEVS, rdevs)
+        # FILERDEVS is an INT16 array (rpm's rpmtag.h), and the main header is
+        # inside an immutable region, so the type is actually checked: writing it
+        # as INT32 gets "tag[18]: BAD, tag 1033 type 4 offset ... count 5 len 10"
+        h.int16(T_FILERDEVS, rdevs)
         h.int32(T_FILEINODES, inodes)
         h.int32(T_FILEDEVICES, devices)
         h.strings(T_FILELANGS, langs)
@@ -423,17 +564,38 @@ class Rpm:
         main = h.build()
 
         # --- signature header ---------------------------------------------
-        sha1 = hashlib.sha1(compressed).digest()
-        sha256 = hashlib.sha256(compressed).digest()
-        sig = _Header()
+        # rpm's signature reader insists on the region wrapper: the header must
+        # start with an RPMTAG_HEADERSIGNATURES entry whose negative-count
+        # trailer closes the store.  Without it rpm says
+        #     "signature hdr magic: BAD"  (or "region trailer: BAD")
+        # and refuses the package, even though nm, file(1) and every
+        # independent parser are perfectly happy with it.
+        sig = _Header(region=True)
+        # The SHA1/SHA256 entries in the signature header are digests of the
+        # *main header*, not of the payload: rpm calls
+        # `rpmvsInitRange(vs, RPMSIG_HEADER)` right after reading the signature
+        # and then `hdrblobDigestUpdate(blob)` for the main header, and that
+        # function hashes
+        #     magic + il + dl + index + store
+        # A wrong value here is reported as
+        #     "Header SHA256 digest: BAD (package tag 273: invalid type 7)"
+        # (type 7 = the binary blob this used to write instead of a hex string).
         sig.int32(S_SIZE, len(compressed))
         sig.binary(S_MD5, hashlib.md5(compressed).digest())
-        sig.binary(S_SHA1, sha1)
-        sig.binary(S_SHA256, sha256)
+        sig.string(S_SHA1, hashlib.sha1(main).hexdigest())
+        sig.string(S_SHA256, hashlib.sha256(main).hexdigest())
         sig.int32(S_PAYLOADSIZE, len(raw_cpio))
         sig.align8()
-        sig_blob = sig.build()
         lead = self._lead()
+        sig_blob = sig.build()
+        # The 96-byte lead sits in front of the signature header, so the header
+        # itself may need one more whole 8-byte block to put `lead + signature`
+        # on a multiple of 8.  That padding goes in front of the trailer, inside
+        # the store.
+        want = ((len(lead) + len(sig_blob) + 7) // 8 * 8) - len(lead)
+        if want > len(sig_blob):
+            sig.compute_pad(want)
+            sig_blob = sig.build()
         assert (len(lead) + len(sig_blob)) % 8 == 0, "signature misaligned"
         return lead + sig_blob + main + compressed
 

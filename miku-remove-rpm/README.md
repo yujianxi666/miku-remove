@@ -45,10 +45,12 @@ dnf 的事务百分比跟着歌词一格格涨上去。
 
 ## 1. 快速开始
 
-打包只要 Python 3 —— **不需要 `rpmbuild`、不需要 `rpm`、也不需要 Linux**：
-`tools/rpmbuild.py` 自己写 RPM 的 lead / signature header / header / cpio 载荷。
+打包需要 Python 3 **和 `rpmbuild`**（生成合法 RPM 头部最可靠的方式）：
 
 ```sh
+sudo dnf install rpm-build      # Fedora / RHEL
+# openSUSE: sudo zypper install rpm-build
+
 # 默认：歌曲在安装时后台预取、卸载前按需下载
 python3 tools/build_rpm.py
 # 等价于
@@ -65,6 +67,10 @@ python3 tools/build_rpm.py --profile deb                  # 换成 apt/dpkg 的�
 ```sh
 sudo dnf install ./dist/*.rpm      # 52 个包一次装完，本体的 %post 会后台把歌抓下来
 ```
+
+> 想避免把 `mpv` 那一大串多媒体依赖一起装进来：
+> `sudo dnf install --setopt=install_weak_deps=False ./dist/*.rpm`
+> （播放器只是 `Recommends`，不装也能演，只是没声音。）
 
 卸载（拆掉整条链，演出开始）：
 
@@ -84,19 +90,21 @@ miku-voicebank-show --no-audio     # 只听歌词，不播放
 miku-voicebank-show --calibrate    # 边听边用 [ ] { } 微调歌词偏移，s 保存
 ```
 
-## 2. 打包器（tools/rpmbuild.py）
+## 2. 打包器（tools/build_rpm.py）
 
-RPM 的文件格式是自己写的，所以这台机器上不需要任何 rpm 工具链：
-
-* **lead**（96 字节）+ **signature header**（8 字节对齐，含 payload 的 md5/sha1/sha256）
-  + **header**（所有 tag，大端整数）+ **gzip 压缩的 cpio newc 载荷**；
-* 文件元数据（`basenames`/`dirnames`/`dirindexes`/`filesizes`/`filemodes`/`filedigests`…）
-  与 cpio 成员一一对应，校验和逐字节自洽；
-* `tools/_check_rpm.py` 会**独立**把这些再解析一遍核对：
+元数据（依赖链、脚本钩子、文件列表）和载荷（演出脚本、时间轴、假记忆文件）由 Python 组装，
+**头部和签名交给 `rpmbuild` 写**——这是让 rpm/dnf 真正接受这些包最可靠的做法：
+header / region / signature 的若干不变量（区域 trailer 的计数、条目对齐、
+哪个摘要覆盖哪一段）手写极易出错，`tools/rpmbuild.py` 里逐条记录了它们，
+`tools/_check_rpm.py` 则用系统自带的 rpm 复核产物：
 
 ```sh
-python3 tools/_check_rpm.py dist/*.rpm      # 52 个包全部结构自检
+python3 tools/_check_rpm.py dist/*.rpm      # rpm -K + rpm -qp，52 个包
 ```
+
+实测（Fedora 44 / rpm 6.0.2）：52 个包 `rpm -K` 全部 `digests OK`，
+`sudo dnf install ./dist/*.rpm` 一次装齐，`sudo dnf remove miku-voicebank-pack`
+按 pack1…pack51、本体的顺序拆完。
 
 ## 3. 需要什么
 
@@ -104,8 +112,11 @@ python3 tools/_check_rpm.py dist/*.rpm      # 52 个包全部结构自检
 | --- | --- |
 | Fedora / RHEL / CentOS Stream / openSUSE（rpm + dnf/zypper） | 包是 `noarch` 的，任何架构都能装 |
 | Python 3 | 本体包 `Requires: python3`；演出脚本和下载都只用标准库 |
-| 一个能解码 mp3 的播放器 | `mpv` / `ffplay` / `cvlc` / `mpg123` 自动检测。本体包 `Requires: mpv`，`Recommends: ffmpeg-free, mpg123, vlc` |
+| 一个能解码 mp3 的播放器 | `mpv` / `ffplay` / `cvlc` / `mpg123` 自动检测。播放器是**弱依赖**（`Recommends: mpv, ffmpeg-free, mpg123, vlc, pipewire-utils`），不装也能演，只是没声音 |
 | 网络（可选） | 只在需要下载歌曲时用到；把音频放进包里就能完全离线 |
+
+> 播放器故意写成 `Recommends` 而不是 `Requires`：dnf 卸载时会连带删掉依赖树，
+> 硬依赖 `mpv` 会把 mpv 连带它几百个多媒体库一起删掉。
 
 `miku-voicebank-show --check` 会告诉你当前会用到哪个播放器，以及歌曲是本地文件还是待下载。
 
@@ -178,9 +189,9 @@ miku-remove-rpm/
 │   ├── etc/show.conf               装到 /etc/miku-voicebank/show.conf
 │   └── maintainer/postrm           （钩子脚本在 tools/build_rpm.py 里生成）
 ├── tools/
-│   ├── build_rpm.py                打包器：52 个 .rpm 进 dist/
-│   ├── rpmbuild.py                 纯 Python 的 RPM 写入器
-│   ├── _check_rpm.py               独立解析生成的 rpm，核对结构与摘要
+│   ├── build_rpm.py                打包器：生成 spec、调 rpmbuild、52 个 .rpm 进 dist/
+│   ├── _check_rpm.py               用系统 rpm 复核产物（没有 rpm 时退回结构自检）
+│   ├── rpmbuild.py                 RPM 格式笔记 / 纯 Python 写入器（不含成品，勿直接用）
 │   ├── profiles.py                 包管理器词表
 │   ├── common.py                   载荷（脚本/时间轴/配置/假记忆文件）
 │   ├── make_timeline.py            SRT -> timeline.tsv

@@ -1,7 +1,7 @@
 # miku-voicebank (Fedora / RHEL) - build the 51 package rpm chain.
 #
-#   make rpms      -> dist/*.rpm
-#   make check     -> parse the built packages back independently
+#   make rpms      -> dist/*.rpm          (needs rpmbuild: dnf install rpm-build)
+#   make check     -> verify the built packages with rpm
 #   make test      -> run miku-show's self tests
 #   make all       -> test + rpms + check
 #   make clean
@@ -17,6 +17,8 @@ PYTHON ?= python3
 all: test rpms check
 
 rpms:
+	@command -v rpmbuild >/dev/null 2>&1 || { \
+	  echo "rpmbuild not found: sudo dnf install rpm-build"; exit 1; }
 	$(PYTHON) tools/build_rpm.py --count $(COUNT) --offset $(OFFSET) --audio-url "$(AUDIO_URL)"
 
 check:
