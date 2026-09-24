@@ -425,16 +425,3 @@ the avoidance of doubt, this paragraph does not form part of the
 public licenses.
 
 Creative Commons may be contacted at creativecommons.org.
-
-=======================================================================
-
-NOT COVERED BY THE LICENCE ABOVE / 不在上述许可范围内:
-
-  * "初音ミクの消失" (Hatsune Miku no Shoushitsu) - music and lyrics by
-    cosMo@暴走P (cosMo@Bousou-P); the voice belongs to Crypton Future Media.
-  * src/data/timeline.tsv is a transcript of a fan-made subtitle track for
-    that song ("初音ミクの消失"), used here by a fan project.
-  * No audio file is distributed with this project.  The packages download the
-    recording from a URL the user configures at install/removal time.
-
-This project is a fan joke.  Buy the album, don't redistribute the audio.
