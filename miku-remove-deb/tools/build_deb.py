@@ -263,6 +263,9 @@ def build_package(index: int, count: int, audio_path, payload: dict,
                       payload["readme"], 0o644))
         files.append(("usr/share/doc/%s/copyright" % PKG_BASE.rstrip("-"),
                       payload["copyright"], 0o644))
+        if payload.get("license"):
+            files.append(("usr/share/doc/%s/LICENSE" % PKG_BASE.rstrip("-"),
+                          payload["license"], 0o644))
     else:
         files.append(("usr/share/miku-voicebank/packs/pack%d.dat" % index,
                       voicebank_dat(index, count), 0o644))
@@ -392,6 +395,8 @@ def main() -> int:
         "readme": read_text(os.path.join(SRC, "doc", "README.md")) if
         os.path.isfile(os.path.join(SRC, "doc", "README.md")) else b"",
         "copyright": read_text(os.path.join(SRC, "doc", "copyright")),
+        "license": read_text(os.path.join(SRC, "doc", "LICENSE"))
+        if os.path.isfile(os.path.join(SRC, "doc", "LICENSE")) else b"",
         "scripts": lambda i, c: {
             "prerm": render(prerm, i, c),
             "postrm": postrm,

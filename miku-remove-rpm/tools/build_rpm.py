@@ -60,7 +60,7 @@ VERSION = common.show_version()
 PKG_BASE = "miku-voicebank-pack"       # the base package (no number)
 MAINTAINER = "cosMo@暴走P <cosmo@bousou-p.invalid>"
 HOMEPAGE = "https://www.bilibili.com/video/BV1zb8E6cE2a/"
-LICENSE_TAG = "MIT"
+LICENSE_TAG = "CC-BY-SA-4.0"
 VENDOR = "miku-voicebank"
 
 # The player is a *weak* dependency on purpose: `dnf remove` takes the whole
@@ -129,6 +129,8 @@ def base_payload(args, audio_bytes, audio_name):
          common.read_text(os.path.join(SRC, "doc", "README.md")), 0o644),
         ("usr/share/doc/%s/copyright" % PKG_BASE,
          common.read_text(os.path.join(SRC, "doc", "copyright")), 0o644),
+        ("usr/share/doc/%s/LICENSE" % PKG_BASE,
+         common.read_text(os.path.join(SRC, "doc", "LICENSE")), 0o644),
     ]
     if audio_bytes:
         files.append(("usr/share/miku-voicebank/audio/" + audio_name,

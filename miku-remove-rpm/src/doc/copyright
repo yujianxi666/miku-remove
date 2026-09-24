@@ -1,16 +1,27 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: miku-voicebank (a joke package)
+Source: https://github.com/yujianxi666/miku-remove
 
 Files: *
 Copyright: 2026 the miku-voicebank joke
-License: MIT
- Permission is hereby granted, free of charge, to any person obtaining a copy of
- this software and associated documentation files (the "Software"), to deal in
- the Software without restriction, including without limitation the rights to
- use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
- the Software, and to permit persons to whom the Software is furnished to do so.
+License: CC-BY-SA-4.0
+ This work is licensed under the Creative Commons Attribution-ShareAlike 4.0
+ International License.  The full text ships with the package as
+ /usr/share/doc/miku-voicebank-pack/LICENSE, and is also available at
+ https://creativecommons.org/licenses/by-sa/4.0/
  .
- The song "初音ミクの消失" (Hatsune Miku no Shoushitsu) is (c) cosMo@暴走P,
- voice (c) Crypton Future Media, and is NOT covered by this licence.  It ships
- with this package only because the removal sequence is built around it; keep
- the package to yourself and buy the album.
+ You are free to share (copy and redistribute the material in any medium or
+ format) and to adapt it (remix, transform, and build upon it) for any purpose,
+ including commercially, under these terms:
+ .
+   Attribution - keep this notice and credit the project;
+   ShareAlike  - distribute your contributions under the same licence.
+ .
+ NOT COVERED BY THIS LICENCE:
+ .
+ * "初音ミクの消失" (Hatsune Miku no Shoushitsu) - music and lyrics by
+   cosMo@暴走P; the voice belongs to Crypton Future Media.
+ * The lyric timeline src/data/timeline.tsv is a transcript of a fan-made
+   subtitle track for that song.
+ * No audio file is distributed; the packages fetch the recording from a URL
+   configured by the user at install/removal time.

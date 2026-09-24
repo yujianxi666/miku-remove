@@ -178,7 +178,7 @@ python3 tools/build_rpm.py                       # 重新打包
 ```
 miku-remove-rpm/
 ├── README.md                       本文件
-├── LICENSE                         MIT
+├── LICENSE                         CC BY-SA 4.0
 ├── Makefile                        make rpms / make check / make test / make clean
 ├── src/
 │   ├── bin/miku-show               演出脚本（Python 3，只用标准库）
@@ -202,3 +202,11 @@ miku-remove-rpm/
 ├── miku-remove.srt                 原始字幕（时间轴的唯一来源）
 └── mkrm.mp3                        默认下载的那首歌的本地副本（可选，方便离线/测试）
 ```
+
+## 许可
+
+本仓库以 **CC BY-SA 4.0**（署名—相同方式共享）授权，全文见 [`LICENSE`](LICENSE)：
+可以自由使用、修改、再分发，包括商用，条件是按同样方式共享并保留署名。
+
+**歌曲与歌词不在这个许可范围内**：《初音ミクの消失》版权属于 cosMo@暴走P，
+声音属于 Crypton Future Media。本仓库不含音频，只在运行时从可配置的地址获取。

@@ -56,7 +56,7 @@ PKG_BASE = "miku-voicebank-pack"
 PKG_BASE_ARCH = "miku-voicebank-pack"        # pacman allows the plain name
 PACKAGER = "cosMo@暴走P <cosmo@bousou-p.invalid>"
 HOMEPAGE = "https://www.bilibili.com/video/BV1zb8E6cE2a/"
-LICENSE_TAG = "custom:MIT"
+LICENSE_TAG = "CC-BY-SA-4.0"
 
 FAKE_TOTAL = int(5.4 * 1024 * 1024 * 1024)   # 5.4 GiB, as apt reports it
 
@@ -274,6 +274,7 @@ def main() -> int:
                             args.profile)
     readme = common.read_text(os.path.join(SRC, "doc", "README.md"))
     copyright_text = common.read_text(os.path.join(SRC, "doc", "copyright"))
+    license_text = common.read_text(os.path.join(SRC, "doc", "LICENSE"))
     show = common.show_script()
     wrapper = common.wrapper_script()
     vocab_text = common.read_text(os.path.join(HERE, "profiles.py"))
@@ -308,6 +309,8 @@ def main() -> int:
             files.append(("usr/share/doc/%s/README.md" % PKG_BASE, readme, 0o644))
             files.append(("usr/share/doc/%s/copyright" % PKG_BASE,
                           copyright_text, 0o644))
+            files.append(("usr/share/doc/%s/LICENSE" % PKG_BASE,
+                          license_text, 0o644))
             depends = ["python", "sh"]
             optdepends = ["mpv: play the song while the voicebank is removed",
                           "ffmpeg: alternative decoder", "mpg123: alternative decoder"]

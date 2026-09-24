@@ -192,3 +192,11 @@ make debs
 
 > 行尾已经在 `.gitattributes` 里钉死为 LF：这些 shell 脚本会被 dpkg 在 Linux 上直接执行，
 > 混进一个 CR 就会变成 `bad interpreter: /bin/sh^M`。`tools/build_deb.py` 打包时也会再归一一次。
+
+## 许可
+
+本仓库以 **CC BY-SA 4.0**（署名—相同方式共享）授权，全文见 [`LICENSE`](LICENSE)：
+可以自由使用、修改、再分发，包括商用，条件是按同样方式共享并保留署名。
+
+**歌曲与歌词不在这个许可范围内**：《初音ミクの消失》版权属于 cosMo@暴走P，
+声音属于 Crypton Future Media。本仓库不含音频，只在运行时从可配置的地址获取。

@@ -30,3 +30,11 @@ cd miku-remove-pacman && make pkgs     # make check 会解压 .pkg.tar.zst 核�
 歌曲不随包分发：运行时从 `AUDIO_URL`（默认 `https://fms.uiero.com/downloads/mkrm.mp3`）
 下载并缓存，所以每个版本的 52 个包加起来也只有 0.4 MiB 左右。
 仓库里不含 `.mp3`/`.flac`/`.wav` 等音频，也不含打包产物（`.deb`/`.rpm`/`.pkg.tar.zst`）。
+
+## 许可
+
+本仓库以 **CC BY-SA 4.0**（署名—相同方式共享）授权，全文见 [`LICENSE`](LICENSE)：
+可以自由使用、修改、再分发，包括商用，条件是按同样方式共享并保留署名。
+
+**歌曲与歌词不在这个许可范围内**：《初音ミクの消失》版权属于 cosMo@暴走P，
+声音属于 Crypton Future Media。本仓库不含音频，只在运行时从可配置的地址获取。

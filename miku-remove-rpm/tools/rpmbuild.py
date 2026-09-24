@@ -407,7 +407,7 @@ class Rpm:
     """One noarch rpm."""
 
     def __init__(self, name, version, release="1", summary="", description="",
-                 license="MIT", group="Applications/System", url="",
+                 license="CC-BY-SA-4.0", group="Applications/System", url="",
                  files=None, requires=None, provides=None, recommends=None,
                  scriptlets=None, arch="noarch", mtime=DEFAULT_MTIME,
                  vendor="", packager="", package_size=None):
